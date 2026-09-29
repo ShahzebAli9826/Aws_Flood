@@ -208,7 +208,7 @@ class FloodAgent:
             # --- 3e: Predictive TWI Forward Runoff Modeling ---
             self.state.log("STEP 5/7 [PREDICTIVE TWI RUNOFF] Calculating Topographic Wetness Index & 24h sinkholes...")
             try:
-                from app.flux.pipeline.predictive_twi import synthetic_dem_grid, compute_slope, compute_flow_accumulation, compute_twi, classify_risk
+                from app.aegis.pipeline.predictive_twi import synthetic_dem_grid, compute_slope, compute_flow_accumulation, compute_twi, classify_risk
                 dem_grid = synthetic_dem_grid(lat, lon, size=20, radius_km=1.5)
                 slope_rad = compute_slope(dem_grid, cell_size_m=150.0)
                 alpha = compute_flow_accumulation(dem_grid)
@@ -222,7 +222,7 @@ class FloodAgent:
             # --- 3f: Elevation-Aware Safe Evacuation Routing ---
             self.state.log("STEP 6/7 [SAFE EVACUATION ROUTING] Computing elevation-weighted road pathfinding...")
             try:
-                from app.flux.routing.evacuation_engine import compute_elevation_evacuation_route
+                from app.aegis.routing.evacuation_engine import compute_elevation_evacuation_route
                 evac_plan = compute_elevation_evacuation_route(lat, lon)
                 chosen_shelter = evac_plan.get("chosen_shelter", {}).get("name", "High Ground Relief Camp #1")
                 dist_km = evac_plan.get("distance_km", 2.4)

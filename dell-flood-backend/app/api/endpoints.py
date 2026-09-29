@@ -1873,12 +1873,12 @@ def geocode_place(q: str):
     return {"status": "NOT_FOUND", "message": f"Location '{query}' could not be resolved."}
 
 # ===========================================================================
-# FLUX & INTELLIGENT CHATBOT INTEGRATION ENDPOINTS
+# AEGIS & INTELLIGENT CHATBOT INTEGRATION ENDPOINTS
 # ===========================================================================
 
-import app.flux
+import app.aegis
 from app.agent.mireye_chatbot import process_chat_message, mireye_ask, mireye_fetch, mireye_geocode
-from app.flux.pipeline.predictive_twi import (
+from app.aegis.pipeline.predictive_twi import (
     synthetic_dem_grid,
     compute_slope,
     compute_flow_accumulation,
@@ -1886,14 +1886,14 @@ from app.flux.pipeline.predictive_twi import (
     classify_risk,
     compute_flood_susceptibility
 )
-from app.flux.pipeline.triage_engine import (
+from app.aegis.pipeline.triage_engine import (
     load_initial_triage_data,
     node_compute_triage,
     node_apply_overrides,
     node_allocate_shelters,
     ActionType
 )
-from app.flux.routing.graph_router import haversine
+from app.aegis.routing.graph_router import haversine
 
 class IntelligentChatRequest(BaseModel):
     message: str
@@ -1923,7 +1923,7 @@ class TwiPredictRequest(BaseModel):
     patch_radius_km: float = 1.5
     rainfall_mm_forecast: float = 50.0
 
-@router.post("/flux/twi/predict")
+@router.post("/aegis/twi/predict")
 def predict_twi_endpoint(payload: TwiPredictRequest):
     """
     Predictive Topographic Wetness Index (TWI) & 6-24h Forward Runoff Pooling Engine.
@@ -2017,7 +2017,7 @@ class EvacuationPlanRequest(BaseModel):
     target_lat: Optional[float] = None
     target_lon: Optional[float] = None
 
-@router.post("/flux/evacuation/plan")
+@router.post("/aegis/evacuation/plan")
 def evacuation_plan_endpoint(payload: EvacuationPlanRequest):
     """
     Elevation-Weighted Network Routing to Safe High-Ground Shelters.
@@ -2121,7 +2121,7 @@ class TriageOverrideRequest(BaseModel):
     run_thread_id: str
     overrides: List[OverrideItem]
 
-@router.post("/flux/triage/run")
+@router.post("/aegis/triage/run")
 def run_triage_endpoint(payload: TriageRunRequest):
     """
     Day 10: Multi-Criteria Disaster Triage Run with LangGraph Checkpoint.
@@ -2164,7 +2164,7 @@ def run_triage_endpoint(payload: TriageRunRequest):
         print(f"[Triage Run Error] {e}")
         return {"status": "ERROR", "error": str(e)}
 
-@router.post("/flux/triage/override")
+@router.post("/aegis/triage/override")
 def override_triage_endpoint(payload: TriageOverrideRequest):
     """
     Day 10: Human-in-the-Loop Operator Course Correction Overrides.

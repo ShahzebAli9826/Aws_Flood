@@ -290,8 +290,8 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
             }
           ]);
         }
-      } catch (fluxErr) {
-        console.log("Dynamic TWI/Evac Plan calculation error:", fluxErr);
+      } catch (aegisErr) {
+        console.log("Dynamic TWI/Evac Plan calculation error:", aegisErr);
       }
 
 

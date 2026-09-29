@@ -1,11 +1,11 @@
 <div align="center">
 
-# FLUX: AI-Powered Multimodal Satellite Flood Detection & Autonomous Disaster Response System
+# AEGIS: AI-Powered Multimodal Satellite Flood Detection & Autonomous Disaster Response System
 </div>
 
-<b>Flux is an autonomous conversational agent that bridges large language models with real time physical world infrastructure data. Powered by Google Gemini 2.5 Flash and the MirEye Earth API, Flux handles open ended conversational tasks while dynamically routing location sensitive queries to verified spatial, hydrological and environmental hazard tools across the United States.
+<b>Aegis is an autonomous conversational agent that bridges large language models with real time physical world infrastructure data. Powered by Google Gemini 2.5 Flash and the MirEye Earth API, Aegis handles open ended conversational tasks while dynamically routing location sensitive queries to verified spatial, hydrological and environmental hazard tools across the United States.
   
-Emergency managers, field responders and residents often lack instant verified physical world context during extreme weather events, forcing them to manually consult disjointed federal GIS portals. By fusing dual encoder satellite Earth observation (SAR + Optical) with Mireye's sub meter physical intelligence layer, continuous Topographic Wetness Index hydrology, and an in flight human in the loop decision engine, Flux identifies imminent flash flood zones, dynamically routes evacuees away from submersed corridors, and empowers incident commanders in real time. Flux bridges conversational AI with real time geospatial ground telemetry i.e. users ask questions about any US city, county or landmark in plain English and Flux automatically resolves place names into coordinates, queries MirEye's sub meter Earth observation API and delivers actionable safety insights backed by authoritative federal citations (USGS, FEMA, NOAA).</b>
+Emergency managers, field responders and residents often lack instant verified physical world context during extreme weather events, forcing them to manually consult disjointed federal GIS portals. By fusing dual encoder satellite Earth observation (SAR + Optical) with Mireye's sub meter physical intelligence layer, continuous Topographic Wetness Index hydrology, and an in flight human in the loop decision engine, Aegis identifies imminent flash flood zones, dynamically routes evacuees away from submersed corridors, and empowers incident commanders in real time. Aegis bridges conversational AI with real time geospatial ground telemetry i.e. users ask questions about any US city, county or landmark in plain English and Aegis automatically resolves place names into coordinates, queries MirEye's sub meter Earth observation API and delivers actionable safety insights backed by authoritative federal citations (USGS, FEMA, NOAA).</b>
 </p>
 
 </div>
@@ -19,13 +19,13 @@ During major flood disasters, emergency response operations suffer from two fata
 1. The "Flat Map" Blind Spot: Standard satellite segmentation only tells you where surface water was when the satellite passed overhead. It cannot tell you ground elevation, soil saturation, building heights, population counts or which dry roads will submerge in the next 6 hours.
 2. The "Naive Routing" Blind Spot: Evacuation navigation systems route evacuees based on shortest straight line distance, leading civilians directly into low elevation terrain depressions and flooded road basins.
 
-Flux bridges this gap by injecting physical telemetry from the Mireye API (USGS 3DEP DEM elevation, slope, FEMA 100/500 yr floodplains, USGS NHD hydrography, and Overture building footprints) into every routing, triage, and dispatch decision.
+Aegis bridges this gap by injecting physical telemetry from the Mireye API (USGS 3DEP DEM elevation, slope, FEMA 100/500 yr floodplains, USGS NHD hydrography, and Overture building footprints) into every routing, triage, and dispatch decision.
 
 ---
 
 ##  Deep Learning Architecture & Pipeline
 
-Flux implements a custom **Dual-Encoder Multimodal SegFormer architecture** specifically optimized for high-precision flood boundary delineation in challenging weather and all-terrain scenarios.
+Aegis implements a custom **Dual-Encoder Multimodal SegFormer architecture** specifically optimized for high-precision flood boundary delineation in challenging weather and all-terrain scenarios.
 
 ![AEGIS Deep Learning Architecture & Pipeline](assets/architecture_pipeline.png)
 
@@ -61,14 +61,14 @@ Flux implements a custom **Dual-Encoder Multimodal SegFormer architecture** spec
          [Incident Commander Dashboard & SITREP]                      [Geo Targeted Citizen SMS]
 
 ```
- **Core Innovation: What Flux Solves**
+ **Core Innovation: What Aegis Solves**
 
 <img width="331" height="302" alt="image" src="https://github.com/user-attachments/assets/675f372e-c163-436f-878d-a582e7b2e31a" />   
 
 
 ## Empirical Validation: Does Mireye Context Matter?
 
-To prove that the Mireye coordinate round-trip performs critical life-safety work rather than visual decoration, Flux runs an empirical benchmark comparing a **Naive Straight-Line Strategy** against the **Mireye Context-Aware Strategy** across 33 real disaster clusters.
+To prove that the Mireye coordinate round-trip performs critical life-safety work rather than visual decoration, Aegis runs an empirical benchmark comparing a **Naive Straight-Line Strategy** against the **Mireye Context-Aware Strategy** across 33 real disaster clusters.
 
 [SUMMARY RESULTS] 
   - Total Evaluated Clusters    : 33
@@ -125,7 +125,7 @@ Mireye/
 │   └── *.html                              # Interactive Folium tactical disaster maps
 │
 ├── main.py                                 # Main Unified Command-Line Interface (CLI)
-├── run_flux_master.py                      # Master end-to-end execution script
+├── run_aegis_master.py                     # Master end-to-end execution script
 ├── requirements.txt                        # Python dependencies
 ├──  README.md                               # Project documentation
 
@@ -245,7 +245,7 @@ To build a standalone installable `.apk` file for Android:
 
 CLI Reference
 
-Flux provides a powerful, modular CLI via `main.py`:
+Aegis provides a powerful, modular CLI via `main.py`:
 
 | Command | Description | Example |
 | :--- | :--- | :--- |
@@ -262,7 +262,7 @@ Flux provides a powerful, modular CLI via `main.py`:
 
 ## Tactical Disaster Map Visualizations
 
-Flux renders **100% watermark-free, high-contrast Folium HTML maps** built for emergency management operations. Every map includes an interactive Disaster HUD legend and multi-layer toggles:
+Aegis renders **100% watermark-free, high-contrast Folium HTML maps** built for emergency management operations. Every map includes an interactive Disaster HUD legend and multi-layer toggles:
 
 *  **Active Inundation Footprint:** High contrast danger polygon extracted via dual encoder SAR/Optical satellite imagery.
 *  **Critical Runoff Nodes:** Glowing magenta markers identifying concave terrain basins with high TWI scores prone to flash pooling.

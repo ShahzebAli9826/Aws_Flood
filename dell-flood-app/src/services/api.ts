@@ -1320,7 +1320,7 @@ Summary: ${isFlooded ? 'Active inundation requires municipal and evacuation prot
   // --- Predictive TWI & Forward Pooling ---
   async predictTwi(lat: number, lon: number, patchRadiusKm: number = 1.5, rainfallForecast: number = 50.0): Promise<any> {
     try {
-      const res = await fetch(`${this.apiUrl}/flux/twi/predict`, {
+      const res = await fetch(`${this.apiUrl}/aegis/twi/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1356,7 +1356,7 @@ Summary: ${isFlooded ? 'Active inundation requires municipal and evacuation prot
   // --- Elevation-Weighted Evacuation Plan ---
   async getEvacuationPlan(originLat: number, originLon: number, targetLat?: number, targetLon?: number): Promise<any> {
     try {
-      const res = await fetch(`${this.apiUrl}/flux/evacuation/plan`, {
+      const res = await fetch(`${this.apiUrl}/aegis/evacuation/plan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1405,7 +1405,7 @@ Summary: ${isFlooded ? 'Active inundation requires municipal and evacuation prot
   // --- Day 10 Triage & Course Correction ---
   async runTriage(countyOrPolygon: string = 'Athens County, Ohio'): Promise<any> {
     try {
-      const res = await fetch(`${this.apiUrl}/flux/triage/run`, {
+      const res = await fetch(`${this.apiUrl}/aegis/triage/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ county_or_polygon: countyOrPolygon })
@@ -1445,7 +1445,7 @@ Summary: ${isFlooded ? 'Active inundation requires municipal and evacuation prot
 
   async applyTriageOverride(runThreadId: string, overrides: any[]): Promise<any> {
     try {
-      const res = await fetch(`${this.apiUrl}/flux/triage/override`, {
+      const res = await fetch(`${this.apiUrl}/aegis/triage/override`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
