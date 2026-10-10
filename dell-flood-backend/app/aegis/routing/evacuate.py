@@ -15,12 +15,20 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from api.models import FloodPolygon
-from api.cache import polygon_hash
-from shelters.finder import find_shelter_candidates
-from shelters.ranker import rank_shelters
-from shelters.models import EvacuationPlan, RankedShelter
-from routing.osrm import get_routes_batch
+try:
+    from app.aegis.api.models import FloodPolygon
+    from app.aegis.api.cache import polygon_hash
+    from app.aegis.shelters.finder import find_shelter_candidates
+    from app.aegis.shelters.ranker import rank_shelters
+    from app.aegis.shelters.models import EvacuationPlan, RankedShelter
+    from app.aegis.routing.osrm import get_routes_batch
+except ImportError:
+    from api.models import FloodPolygon
+    from api.cache import polygon_hash
+    from shelters.finder import find_shelter_candidates
+    from shelters.ranker import rank_shelters
+    from shelters.models import EvacuationPlan, RankedShelter
+    from routing.osrm import get_routes_batch
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 

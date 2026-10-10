@@ -7,7 +7,10 @@ Generates an interactive Folium map visualizing:
 4. Safe evacuation route paths with elevation cost annotations
 """
 from __future__ import annotations
-import folium
+try:
+    import folium
+except ImportError:
+    folium = None
 from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
@@ -22,7 +25,7 @@ def plot_evacuation_map(
     """
     Generate an interactive HTML map for visual inspection and demos.
     """
-    if not polygon_coords:
+    if not polygon_coords or folium is None:
         return OUTPUT_DIR / output_filename
         
     center_lat = sum(p[0] for p in polygon_coords) / len(polygon_coords)

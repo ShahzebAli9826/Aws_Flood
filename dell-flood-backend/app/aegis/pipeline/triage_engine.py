@@ -290,7 +290,17 @@ def node_apply_overrides(state: TriageGraphState) -> Dict[str, Any]:
                             new_logs.append(log)
 
         elif action == ActionType.ROAD_CLOSED.value:
-            log = f"APPLIED OVERRIDE: {ActionType.ROAD_CLOSED.value} on route target '{target}' -> Rerouting active"
+            for sname, sdata in updated_shelters.items():
+                if target.lower() in sname.lower() or target.lower() in sdata.get("county", "").lower():
+                    sdata["status"] = "REROUTED_ALTERNATE_CORRIDOR"
+                    sdata["remaining_capacity"] = int(sdata.get("remaining_capacity", 0) * 0.5)
+            log = f"APPLIED OVERRIDE: {ActionType.ROAD_CLOSED.value} on route target '{target}' -> Primary corridor closed, rerouting to secondary high-ground shelters"
+            if log not in new_logs:
+                new_logs.append(log)
+
+        elif action == ActionType.FORCE_PRIORITY.value:
+            val = ovr_dict.get("value", 300.0)
+            log = f"APPLIED OVERRIDE: {ActionType.FORCE_PRIORITY.value} on '{target}' -> Priority Score forced to {val}"
             if log not in new_logs:
                 new_logs.append(log)
 
@@ -302,7 +312,6 @@ def node_apply_overrides(state: TriageGraphState) -> Dict[str, Any]:
         "phase": "COURSE_CORRECTION",
         "unallocated_total": state.get("unallocated_total", 0)
     }
-
 
 
 def node_allocate_shelters(state: TriageGraphState) -> Dict[str, Any]:
@@ -364,6 +373,8 @@ def node_allocate_shelters(state: TriageGraphState) -> Dict[str, Any]:
     return {
         "clusters": clusters,
         "shelters": shelters,
+        "overrides": state.get("overrides", []),
+        "override_logs": state.get("override_logs", []),
         "unallocated_total": total_unallocated,
         "phase": "ALLOCATED"
     }

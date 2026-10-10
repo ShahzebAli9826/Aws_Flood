@@ -1,8 +1,8 @@
 import os
+import hashlib
 
 try:
     import chromadb
-    from chromadb.config import Settings
     HAS_CHROMA = True
 except ImportError:
     HAS_CHROMA = False
@@ -13,62 +13,70 @@ try:
 except ImportError:
     HAS_PDF = False
 
-# Default Sample documents for initialization if directory is empty
 SAMPLE_NDMA = """
-NATIONAL DISASTER MANAGEMENT AUTHORITY (NDMA)
-SITUATION REPORT - FLOOD SITUATION IN BIHAR
-1. General Situation: Due to heavy precipitation in Nepal catchment areas, the Kosi and Gandak rivers are flowing above warning marks.
-2. Response Action: SDRF and NDRF teams are deploying rafts and lifejackets to facilitate rescue operations. Safe shelter locations have been opened.
-3. Guidelines: Citizens should stay away from low-lying areas and follow local evacuation alerts.
+NATIONAL DISASTER MANAGEMENT AUTHORITY (NDMA) — INDIA
+STANDARD OPERATING PROCEDURE: URBAN & RIVERINE FLOOD RESPONSE (BIHAR / GANGA-KOSI BASIN)
+1. Early Warning & Triggers: When CWC / GloFAS river discharge exceeds warning thresholds or 5-day antecedent rainfall exceeds 90mm, activate District Emergency Operations Centres (DEOC).
+2. Evacuation & Depth Thresholds: Roads with water depth >= 0.30m are impassable to standard civilian vehicles (risk of engine stall and vehicle buoyancy). Deploy NDRF inflatable motorized boats (IRB) for zones with predicted depth > 0.30m.
+3. Shelter Allocation: Prioritize vulnerable clusters using Topographic Wetness Index (TWI) and elevation safety scores. Ensure potable water (15L/person/day), ORS packets, chlorine tablets, and female-safe sanitation blocks.
+4. SACHET CAP v1.2 Alerting: All public warnings must follow WMO/ITU Common Alerting Protocol (CAP v1.2) in Hindi and English with verified human-in-the-loop (HITL) authorization.
 """
 
 SAMPLE_UNOCHA = """
 UN OFFICE FOR THE COORDINATION OF HUMANITARIAN AFFAIRS (UN-OCHA)
-FLOOD DISASTER BRIEFING - SOUTH ASIA MONSOON
-1. Inundation Levels: Rising river channels have damaged bridges and key arterial roads. Primary clinics require immediate aid.
-2. Strategic Interventions: Distribute clean drinking water, sanitation tablets, tarpaulins, and mobile medical tents.
-3. Medical warning: High humidity raises risk of mosquito vector breeding; distribute medication protocols.
+SOUTH ASIA MONSOON FLASH UPDATE & CLUSTER COORDINATION PROTOCOL
+1. Situation Overview: Multimodal SAR (Sentinel-1) and Optical (Sentinel-2) fusion confirms active floodplain inundation across low-lying alluvial depressions.
+2. WASH & Health Cluster: Standing water > 24 hours elevates waterborne disease risk (cholera, leptospirosis, dengue). Deploy mobile medical teams and halogen tablets to all primary relief camps.
+3. Logistics & Access: Verify time-varying road passability before dispatching relief trucks. Bypass low-lying culverts projected to submerge within 30-60 minutes.
 """
+
+SAMPLE_ASSAM_SDMA = """
+ASSAM STATE DISASTER MANAGEMENT AUTHORITY (ASDMA)
+BRAHMAPUTRA & BARAK VALLEY FLOOD CONTINGENCY PLAN (MAJULI / JORHAT / KAZIRANGA)
+1. Embankment & Breach Monitoring: Monitor high-velocity braided channel erosion along Majuli and Jorhat sectors.
+2. Highland & Relief Camp Activation: Activate designated raised multi-purpose flood shelters and school buildings above 60m ASL.
+3. Livestock & Vulnerable Groups: Prioritize evacuation of pregnant women, elderly citizens, children, and livestock to raised platforms (Highlands).
+"""
+
 
 class FloodVectorDB:
     def __init__(self, db_path="./chroma_data", corpus_path="./corpus"):
         self.db_path = db_path
         self.corpus_path = corpus_path
         self.has_chroma = HAS_CHROMA
-        
+
         os.makedirs(db_path, exist_ok=True)
         os.makedirs(corpus_path, exist_ok=True)
-        
+        self._ensure_default_samples()
+
         if self.has_chroma:
             try:
                 self.client = chromadb.PersistentClient(path=db_path)
                 self.collection = self.client.get_or_create_collection(
                     name="flood_situation_reports"
                 )
-                
-                # If corpus folder is completely empty, initialize it with sample files
-                if len(os.listdir(corpus_path)) == 0:
-                    self._write_default_samples()
-                    
-                # Dynamically ingest corpus files
                 self.ingest_corpus_files()
             except Exception as e:
-                print(f"[RAG Database] Client initialization failed: {e}. Running in sandbox mode.")
+                print(f"[RAG Database] Client initialization failed: {e}. Running in fallback mode.")
                 self.has_chroma = False
         else:
-            print("[RAG Database Sandbox] ChromaDB not installed. Ingestions and queries will use mock templates.")
+            print("[RAG Database Sandbox] ChromaDB not installed. Using in-memory SOP templates.")
 
-    def _write_default_samples(self):
-        print("[RAG Database] Writing default sample documents into ./corpus directory...")
-        with open(os.path.join(self.corpus_path, "ndma_bihar.txt"), "w", encoding="utf-8") as f:
-            f.write(SAMPLE_NDMA)
-        with open(os.path.join(self.corpus_path, "un_ocha_southasia.txt"), "w", encoding="utf-8") as f:
-            f.write(SAMPLE_UNOCHA)
+    def _ensure_default_samples(self):
+        defaults = {
+            "ndma_bihar_sop.txt": SAMPLE_NDMA,
+            "un_ocha_southasia.txt": SAMPLE_UNOCHA,
+            "assam_sdma_contingency.txt": SAMPLE_ASSAM_SDMA,
+        }
+        for fname, text in defaults.items():
+            fpath = os.path.join(self.corpus_path, fname)
+            if not os.path.exists(fpath):
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(text.strip() + "\n")
 
     def extract_text_from_pdf(self, pdf_path):
         text = ""
         if not HAS_PDF:
-            print("[RAG PDF Loader] pypdf is not installed. Skipping PDF parse.")
             return text
         try:
             reader = pypdf.PdfReader(pdf_path)
@@ -80,36 +88,42 @@ class FloodVectorDB:
             print(f"[RAG Database] Error parsing PDF {pdf_path}: {e}")
         return text
 
-    def chunk_text(self, text, chunk_size=500, overlap=100):
+    def chunk_text(self, text, chunk_size=350, overlap=75):
         chunks = []
         words = text.split()
-        
         i = 0
         while i < len(words):
-            chunk = " ".join(words[i:i + chunk_size])
+            chunk = " ".join(words[i : i + chunk_size])
             chunks.append(chunk)
-            i += (chunk_size - overlap)
-            
+            i += max(1, (chunk_size - overlap))
         return [c for c in chunks if len(c.strip()) > 30]
 
     def ingest_corpus_files(self):
+        """
+        Incremental SHA-256 hash-based indexing (Solves P16).
+        New or modified files in ./corpus are automatically upserted on startup
+        without skipping when collection.count() > 0.
+        """
         if not self.has_chroma:
             return
-            
+
         try:
-            count = self.collection.count()
-            if count > 0:
-                print(f"[RAG Database] Collection ready with {count} indexed chunks.")
-                return
-                
-            print("[RAG Database] Scanning ./corpus directory for dynamic ingestion...")
-            files = os.listdir(self.corpus_path)
-            
-            doc_id_counter = 1
+            existing_ids = set()
+            try:
+                existing_data = self.collection.get(include=[])
+                existing_ids = set(existing_data.get("ids", []))
+            except Exception:
+                pass
+
+            files = sorted(os.listdir(self.corpus_path))
+            new_upserts = 0
+
             for filename in files:
                 filepath = os.path.join(self.corpus_path, filename)
+                if not os.path.isfile(filepath):
+                    continue
                 ext = os.path.splitext(filename)[1].lower()
-                
+
                 raw_text = ""
                 if ext in [".txt", ".md"]:
                     try:
@@ -119,57 +133,49 @@ class FloodVectorDB:
                         print(f"Error reading file {filename}: {e}")
                 elif ext == ".pdf":
                     raw_text = self.extract_text_from_pdf(filepath)
-                    
+
                 if not raw_text.strip():
                     continue
-                    
-                chunks = self.chunk_text(raw_text)
-                print(f"[RAG Database] Ingesting {filename} ({len(chunks)} chunks)...")
-                
-                documents = []
-                metadatas = []
-                ids = []
-                
-                for index, chunk in enumerate(chunks):
-                    documents.append(chunk)
-                    metadatas.append({"source": filename, "chunk_index": index})
-                    ids.append(f"doc_{doc_id_counter}_{index}")
-                    
-                if documents:
-                    self.collection.add(
-                        documents=documents,
-                        metadatas=metadatas,
-                        ids=ids
-                    )
-                doc_id_counter += 1
-                
-            print(f"[RAG Database] Ingestion finished. Total indexed documents count: {self.collection.count()}")
-        except Exception as e:
-            print(f"[RAG Database] Ingestion failed: {e}")
 
-    def query_similar_reports(self, query_text, n_results=2):
+                file_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:10]
+                chunks = self.chunk_text(raw_text)
+
+                documents, metadatas, ids = [], [], []
+                for index, chunk in enumerate(chunks):
+                    doc_id = f"doc_{filename}_{file_hash}_{index}"
+                    if doc_id not in existing_ids:
+                        documents.append(chunk)
+                        metadatas.append({"source": filename, "chunk_index": index, "sha256": file_hash})
+                        ids.append(doc_id)
+
+                if documents:
+                    self.collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+                    new_upserts += len(documents)
+
+            print(
+                f"[RAG Database] Incremental index sync complete (+{new_upserts} new chunks, "
+                f"total={self.collection.count()})."
+            )
+        except Exception as e:
+            print(f"[RAG Database] Incremental ingestion failed: {e}")
+
+    def query_similar_reports(self, query_text, n_results=3):
         if not self.has_chroma:
             return [
-                {"content": SAMPLE_NDMA, "metadata": {"source": "ndma_bihar.txt", "chunk_index": 0}},
-                {"content": SAMPLE_UNOCHA, "metadata": {"source": "un_ocha_southasia.txt", "chunk_index": 0}}
+                {"content": SAMPLE_NDMA, "metadata": {"source": "ndma_bihar_sop.txt", "chunk_index": 0}},
+                {"content": SAMPLE_UNOCHA, "metadata": {"source": "un_ocha_southasia.txt", "chunk_index": 0}},
+                {"content": SAMPLE_ASSAM_SDMA, "metadata": {"source": "assam_sdma_contingency.txt", "chunk_index": 0}},
             ][:n_results]
-            
+
         try:
-            results = self.collection.query(
-                query_texts=[query_text],
-                n_results=n_results
-            )
-            similar_docs = []
-            if results and 'documents' in results and len(results['documents']) > 0:
-                for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-                    similar_docs.append({
-                        "content": doc,
-                        "metadata": meta
-                    })
-            return similar_docs
+            results = self.collection.query(query_texts=[query_text], n_results=n_results)
+            formatted_results = []
+            if results and "documents" in results and len(results["documents"]) > 0:
+                docs = results["documents"][0]
+                metas = results["metadatas"][0] if "metadatas" in results and results["metadatas"] else [{}] * len(docs)
+                for doc, meta in zip(docs, metas):
+                    formatted_results.append({"content": doc, "metadata": meta})
+            return formatted_results
         except Exception as e:
-            print(f"[RAG Database] Query failed: {e}. Returning sandbox templates.")
-            return [
-                {"content": SAMPLE_NDMA, "metadata": {"source": "ndma_bihar.txt", "chunk_index": 0}},
-                {"content": SAMPLE_UNOCHA, "metadata": {"source": "un_ocha_southasia.txt", "chunk_index": 0}}
-            ][:n_results]
+            print(f"[RAG Database] Query error: {e}")
+            return [{"content": SAMPLE_NDMA, "metadata": {"source": "ndma_bihar_sop.txt", "chunk_index": 0}}]

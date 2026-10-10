@@ -4,8 +4,10 @@ import * as Speech from 'expo-speech';
 import { WebView } from 'react-native-webview';
 import { Search, Sliders, Layers, MapPin, Navigation, Info, AlertTriangle, Compass, Calendar, Activity, Eye, ShieldAlert, Home, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, ShieldCheck, Users, HelpCircle, FileText, Map, Zap, GraduationCap, Building2, ChevronRight, Target, Droplets, Shield } from 'lucide-react-native';
 import { apiService, DEFAULT_API_URL, DetectionResult, ShelterInfo, CrowdReport } from '../services/api';
+import { AppLanguage, t } from '../utils/i18n';
 
 const { width: windowWidth } = Dimensions.get('window');
+const IS_COMPACT_LAYOUT = Platform.OS !== 'web' || windowWidth < 600;
 const MAP_CONTAINER_WIDTH = windowWidth > 500 ? 500 : windowWidth - 32;
 const MAP_HEIGHT = 280;
 
@@ -14,6 +16,7 @@ interface MapViewProps {
   lastDetection: DetectionResult | null;
   initialLat?: number;
   initialLon?: number;
+  language?: AppLanguage;
 }
 
 // Pre-defined Village/District Hazard Zones with distinct flood probabilities
@@ -39,7 +42,7 @@ const CITY_GEOCODING: Record<string, { lat: number; lon: number }> = {
   "kolkata": { lat: 22.5726, lon: 88.3639 }
 };
 
-export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetection, initialLat = 22.0, initialLon = 79.0 }) => {
+export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetection, initialLat = 22.0, initialLon = 79.0, language = 'en' }) => {
   const [lat, setLat] = useState<number>(initialLat);
   const [lon, setLon] = useState<number>(initialLon);
   const iframeRef = React.useRef<any>(null);
@@ -108,7 +111,11 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
   const [sarB64, setSarB64] = useState<string | null>(null);
   const [segmentationCompositeB64, setSegmentationCompositeB64] = useState<string | null>(null);
   const [probabilityHeatmapB64, setProbabilityHeatmapB64] = useState<string | null>(null);
+  const [opticalOnlyB64, setOpticalOnlyB64] = useState<string | null>(null);
   const [showHeatmapToggle, setShowHeatmapToggle] = useState<boolean>(false);
+  const [showOpticalOnlyToggle, setShowOpticalOnlyToggle] = useState<boolean>(false);
+  const [urnnNowcastData, setUrnnNowcastData] = useState<any>(null);
+  const [selectedUrnnHorizon, setSelectedUrnnHorizon] = useState<number>(60);
   const [previews, setPreviews] = useState<{ optical_preview: string; sar_preview: string; timestamp: string } | null>(null);
   
   // Basemap View Modes: 'fused' (Satellite) | 'sar' (Radar) | 'google' (Standard Map) | 'segmented' (Green & White Water Classification)
@@ -225,7 +232,9 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
     setSarB64(null);
     setSegmentationCompositeB64(null);
     setProbabilityHeatmapB64(null);
-    setStatusMessage("Step 1/5: Acquiring Sentinel satellite radar & optical bands...");
+    setOpticalOnlyB64(null);
+    setUrnnNowcastData(null);
+    setStatusMessage("Step 1/16: Acquiring Sentinel satellite radar & optical bands...");
     iframeRef.current?.contentWindow?.postMessage({ type: 'SHOW_LOADING', lat: selectedLat, lon: selectedLon }, '*');
     try {
       const prevs = await apiService.getSatellitePreview(selectedLat, selectedLon);
@@ -249,6 +258,8 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           if (statusObj.partial_result.sar_b64) setSarB64(statusObj.partial_result.sar_b64);
           if (statusObj.partial_result.segmentation_composite_b64) setSegmentationCompositeB64(statusObj.partial_result.segmentation_composite_b64);
           if (statusObj.partial_result.probability_heatmap_b64) setProbabilityHeatmapB64(statusObj.partial_result.probability_heatmap_b64);
+          if (statusObj.partial_result.optical_only_b64) setOpticalOnlyB64(statusObj.partial_result.optical_only_b64);
+          if (statusObj.partial_result.urnn_nowcast) setUrnnNowcastData(statusObj.partial_result.urnn_nowcast);
         }
       });
       
@@ -256,6 +267,12 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
       if ((result as any)?.sar_b64) setSarB64((result as any).sar_b64);
       if ((result as any)?.segmentation_composite_b64) setSegmentationCompositeB64((result as any).segmentation_composite_b64);
       if ((result as any)?.probability_heatmap_b64) setProbabilityHeatmapB64((result as any).probability_heatmap_b64);
+      if ((result as any)?.optical_only_b64) setOpticalOnlyB64((result as any).optical_only_b64);
+      if ((result as any)?.urnn_nowcast) {
+        setUrnnNowcastData((result as any).urnn_nowcast);
+      } else {
+        apiService.getNowcast(selectedLat, selectedLon).then(nc => setUrnnNowcastData(nc)).catch(() => {});
+      }
 
       // Dynamically calculate Topographic Wetness Index runoff and elevation safe shelter evacuation route
       try {
@@ -308,6 +325,10 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
       loadMapData();
     } catch (e: any) {
       console.log("Detection caught error:", e);
+      const message = e?.message || "Satellite acquisition or model inference failed.";
+      setStatusMessage(message);
+      setSteps([{ step: "error", message, done: false }]);
+      iframeRef.current?.contentWindow?.postMessage({ type: 'INFERENCE_ERROR', message }, '*');
     } finally {
       setLoading(false);
       isRunningRef.current = false;
@@ -421,7 +442,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
       <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
       <style>
         html, body, #map { height: 100%; margin: 0; padding: 0; background: ${isSegmented ? '#000000' : '#f1f5f9'}; }
-        .leaflet-control-attribution { display: none; }
+        .leaflet-control-attribution { font-size: 8px !important; background: rgba(255,255,255,0.85) !important; padding: 1px 5px !important; }
         .leaflet-tooltip { font-size: 9px; font-weight: bold; padding: 3px 6px; border-radius: 5px; background: rgba(255,255,255,0.96); border: 1px solid #cbd5e1; box-shadow: 0 2px 6px rgba(0,0,0,0.15); }
         .river-label {
           background: transparent !important;
@@ -497,8 +518,17 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
         <div class="plabel">Live Satellite View</div>
       </div>
       <script>
+        function escapeHtml(str) {
+          if (str === null || str === undefined) return '';
+          return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        }
         var isCountryOverview = (${lat === 22.0 && lon === 79.0 && lastDetection === null ? 'true' : 'false'});
-        var map = L.map('map', { zoomControl: true }).setView([${lat}, ${lon}], isCountryOverview ? 5 : 13);
+        var map = L.map('map', { zoomControl: true, attributionControl: true }).setView([${lat}, ${lon}], isCountryOverview ? 5 : 13);
 
         if (!isCountryOverview) {
           var targetIcon = L.divIcon({
@@ -521,13 +551,14 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           }).addTo(map);
         }
 
-        // --- Basemap tiles ---
+        // --- Basemap tiles with attribution (P25) ---
+        var tileAttr = '&copy; OpenStreetMap contributors &copy; Esri &copy; Copernicus Sentinel data';
         if ('${mapViewMode}' === 'fused') {
-          L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}').addTo(map);
+          L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: tileAttr }).addTo(map);
         } else if ('${mapViewMode}' === 'sar') {
-          L.tileLayer('https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png').addTo(map);
+          L.tileLayer('https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', { attribution: tileAttr }).addTo(map);
         } else if ('${mapViewMode}' === 'google') {
-          L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}').addTo(map);
+          L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', { attribution: tileAttr }).addTo(map);
         }
         // segmented = black canvas, no tile layer
 
@@ -555,7 +586,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
         function showResultCard(prob, severity, color) {
           spinner.style.display = 'none';
           cardTitle.textContent = 'Model Result';
-          cardSub.textContent = 'SegFormer inference complete';
+          cardSub.textContent = 'SegFormer + U-RNN inference complete';
           cardProb.style.display = 'block';
           cardProb.textContent = prob + '%';
           cardProb.style.color = color;
@@ -600,13 +631,13 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           map.flyTo([e.latlng.lat, e.latlng.lng], 13);
           window.parent.postMessage({ type: 'MAP_TAP', lat: e.latlng.lat, lon: e.latlng.lng }, '*');
 
-          // Reverse geocode for POI name
+          // Reverse geocode for POI name (Sanitized via escapeHtml - P3)
           fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat=' + e.latlng.lat + '&lon=' + e.latlng.lng + '&zoom=18&addressdetails=1')
             .then(function(r) { return r.json(); })
             .then(function(data) {
-              var name = data.name || data.display_name.split(',')[0] || 'Unknown Location';
+              var name = escapeHtml(data.name || (data.display_name ? data.display_name.split(',')[0] : '') || 'Unknown Location');
               var type = data.type || data.class || 'place';
-              var icon = type === 'water' ? 'Water Body' : type === 'university' ? 'University' : type === 'hospital' ? 'Hospital' : type === 'school' ? 'School' : type === 'park' ? 'Park' : 'Location';
+              var icon = escapeHtml(type === 'water' ? 'Water Body' : type === 'university' ? 'University' : type === 'hospital' ? 'Hospital' : type === 'school' ? 'School' : type === 'park' ? 'Park' : 'Location');
               L.popup({ className: 'poi-popup' })
                 .setLatLng(e.latlng)
                 .setContent('<div class="poi-name">' + name + '</div><div class="poi-type">' + icon + '</div><div class="poi-coords">' + e.latlng.lat.toFixed(5) + ', ' + e.latlng.lng.toFixed(5) + '</div>')
@@ -667,12 +698,13 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           }).addTo(map);
 
           if (evacData.chosen_shelter) {
+            var safeShelterName = escapeHtml(evacData.chosen_shelter.name);
             var destIcon = L.divIcon({
-              html: '<div style="background:#10b981;color:#fff;padding:4px 8px;border-radius:8px;border:2px solid #fff;box-shadow:0 2px 8px rgba(16,185,129,0.5);font-size:12px;font-weight:bold;white-space:nowrap;">🏃 ' + evacData.chosen_shelter.name + '</div>',
+              html: '<div style="background:#10b981;color:#fff;padding:4px 8px;border-radius:8px;border:2px solid #fff;box-shadow:0 2px 8px rgba(16,185,129,0.5);font-size:12px;font-weight:bold;white-space:nowrap;">🏃 ' + safeShelterName + '</div>',
               className: '', iconSize: [140, 28], iconAnchor: [70, 14]
             });
             L.marker([evacData.chosen_shelter.lat, evacData.chosen_shelter.lng], { icon: destIcon }).addTo(map)
-              .bindPopup('<b>Safe High-Ground Relief Shelter</b><br>' + evacData.chosen_shelter.name + '<br>Distance: ' + evacData.distance_km + ' km | Elevation Gain: +' + (evacData.elevation_gain_m || 20) + 'm ASL');
+              .bindPopup('<b>Safe High-Ground Relief Shelter</b><br>' + safeShelterName + '<br>Distance: ' + escapeHtml(evacData.distance_km) + ' km | Elevation Gain: +' + escapeHtml(evacData.elevation_gain_m || 20) + 'm ASL');
           }
         }
 
@@ -697,7 +729,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
               className: '', iconSize: [30, 30], iconAnchor: [15, 15]
             });
             var m = L.marker([s.lat, s.lon], { icon: tentIcon });
-            m.bindTooltip('<b>⛺ Shelter: ' + s.name + '</b><br>' + s.slots + ' slots available<br>Capacity: ' + s.capacity.toUpperCase(), { direction: 'top' });
+            m.bindTooltip('<b>⛺ Shelter: ' + escapeHtml(s.name) + '</b><br>' + escapeHtml(s.slots) + ' slots available<br>Capacity: ' + escapeHtml((s.capacity || '').toUpperCase()), { direction: 'top' });
             clusterGroup.addLayer(m);
           });
 
@@ -709,7 +741,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
               className: '', iconSize: [24, 24], iconAnchor: [12, 12]
             });
             var m = L.marker([c.lat, c.lon], { icon: wIcon });
-            m.bindTooltip('<b>Waterlogging Report</b><br>' + c.description, { direction: 'bottom' });
+            m.bindTooltip('<b>Waterlogging Report</b><br>' + escapeHtml(c.description), { direction: 'bottom' });
             clusterGroup.addLayer(m);
           });
         }
@@ -745,7 +777,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
   const bldPercentage = Math.min(100, (bldDamaged / 500) * 100);
 
   return (
-    <ScrollView ref={mapScrollViewRef} style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 30 }} nestedScrollEnabled={true}>
+    <ScrollView ref={mapScrollViewRef} style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: Platform.OS === 'web' ? 30 : 110 }} nestedScrollEnabled={true}>
       {/* Coordinate Search */}
       <View 
         style={[styles.searchContainer, loading && { backgroundColor: '#f1f5f9', borderColor: '#cbd5e1', opacity: 0.75 }]}
@@ -754,7 +786,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
         <Search color={loading ? "#94a3b8" : "#64748b"} size={20} style={{ marginRight: 8 }} />
         <TextInput
           style={[styles.searchInput, loading && { color: '#94a3b8' }]}
-          placeholder={loading ? "Analyzing... Search locked until results are ready" : "Search coordinates or place (e.g. Delhi, Patna)..."}
+          placeholder={loading ? t(language, 'searchBusyPlaceholder') : t(language, 'searchPlaceholder')}
           placeholderTextColor="#94a3b8"
           value={searchQuery}
           onChangeText={setSearchQuery}
@@ -769,10 +801,10 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           {loading ? (
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
               <ActivityIndicator size="small" color="#ffffff" />
-              <Text style={[styles.searchButtonText, { fontSize: 11 }]}>Busy</Text>
+              <Text style={[styles.searchButtonText, { fontSize: 11 }]}>{language === 'hi' ? 'व्यस्त' : 'Busy'}</Text>
             </View>
           ) : (
-            <Text style={styles.searchButtonText}>Search</Text>
+            <Text style={styles.searchButtonText}>{t(language, 'searchBtn')}</Text>
           )}
         </TouchableOpacity>
       </View>
@@ -782,7 +814,11 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
       <View style={styles.mapViewportContainer}>
           <View style={styles.scrollHelpBanner}>
             <HelpCircle size={12} color="#1d4ed8" style={{ marginRight: 4 }} />
-            <Text style={styles.scrollHelpText}>💡 Drag/Swipe with mouse or touch to scroll, pan and zoom coordinates.</Text>
+            <Text style={styles.scrollHelpText}>
+              {language === 'hi'
+                ? '💡 मानचित्र पर किसी भी स्थान पर क्लिक करें या ऊपर शहर का नाम खोजें।'
+                : '💡 Drag/Swipe with mouse or touch to scroll, pan and zoom coordinates.'}
+            </Text>
           </View>
 
           {Platform.OS === 'web' ? (
@@ -808,8 +844,12 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           {loading && (
             <View style={styles.mapLoadingOverlay}>
               <ActivityIndicator size="large" color="#2563eb" />
-              <Text style={styles.mapLoadingOverlayText}>Processing Satellite Analysis...</Text>
-              <Text style={styles.mapLoadingOverlaySub}>Please wait until current place finishes</Text>
+              <Text style={styles.mapLoadingOverlayText}>
+                {language === 'hi' ? 'उपग्रह विश्लेषण जारी है...' : 'Processing Satellite Analysis...'}
+              </Text>
+              <Text style={styles.mapLoadingOverlaySub}>
+                {language === 'hi' ? 'कृपया वर्तमान स्थान के परिणाम आने तक प्रतीक्षा करें' : 'Please wait until current place finishes'}
+              </Text>
             </View>
           )}
 
@@ -841,7 +881,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
         <View style={styles.panelCard}>
           <View style={styles.cardHeader}>
             <Activity size={18} color="#2563eb" style={{ marginRight: 6 }} />
-            <Text style={styles.cardTitle}>Live Pipeline Console</Text>
+            <Text style={styles.cardTitle}>{t(language, 'pipelineConsoleTitle')}</Text>
             <View style={{ marginLeft: 'auto', backgroundColor: '#f0f9ff', borderWidth: 1, borderColor: '#bae6fd', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 6 }}>
               <Text style={{ fontSize: 10, fontWeight: '700', color: '#0284c7' }}>☁️ {cloudCover}% Cloud Cover</Text>
             </View>
@@ -871,9 +911,9 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
                 </Text>
               </View>
             )}
-            {!loading && steps.length > 0 && (
+            {!loading && steps.length > 0 && !steps.some(s => s.step === 'error') && (
               <View style={styles.resultReadyBanner}>
-                <Text style={styles.resultReadyText}>🌟 RESULTS READY 🌟</Text>
+                <Text style={styles.resultReadyText}>{t(language, 'pipelineReadyBanner')}</Text>
               </View>
             )}
           </View>
@@ -885,7 +925,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
         <View style={styles.panelCard}>
           <View style={styles.cardHeader}>
             <Layers size={18} color="#2563eb" style={{ marginRight: 6 }} />
-            <Text style={styles.cardTitle}>Satellite Image Acquisition</Text>
+            <Text style={styles.cardTitle}>Satellite Image Acquisition & 4D U-RNN Nowcast</Text>
             <View style={{ marginLeft: 'auto', backgroundColor: '#e0f2fe', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
               <Text style={{ fontSize: 11, fontWeight: '700', color: '#0284c7' }}>☁️ {cloudCover}% Cloud Cover</Text>
             </View>
@@ -894,7 +934,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
           <View style={{ gap: 12 }}>
             {/* Panel 1: Sentinel-2 Optical */}
             <View style={styles.imagePanel}>
-              <Text style={styles.imagePanelLabel}>Sentinel-2 Optical (RGB)</Text>
+              <Text style={styles.imagePanelLabel}>1. Sentinel-2 Optical (RGB)</Text>
               {opticalB64 ? (
                 <Image source={{ uri: opticalB64 }} style={styles.panelImage} />
               ) : (
@@ -909,7 +949,7 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
 
             {/* Panel 2: Sentinel-1 SAR */}
             <View style={styles.imagePanel}>
-              <Text style={styles.imagePanelLabel}>Sentinel-1 SAR (VV band)</Text>
+              <Text style={styles.imagePanelLabel}>2. Sentinel-1 SAR (VV band)</Text>
               {sarB64 ? (
                 <Image source={{ uri: sarB64 }} style={styles.panelImage} />
               ) : (
@@ -920,22 +960,36 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
               <Text style={styles.panelCaption}>Radar — sees through cloud occlusion</Text>
             </View>
 
-            {/* Panel 3: Model Segmentation Output */}
+            {/* Panel 3: Model Segmentation Output + Optical-Only vs SAR+Optical Fusion toggle (P19) */}
             <View style={styles.imagePanel}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                <Text style={styles.imagePanelLabel}>Flood Segmentation</Text>
-                {(segmentationCompositeB64 || probabilityHeatmapB64) && (
-                  <TouchableOpacity 
-                    style={styles.panelToggleBtn}
-                    onPress={() => setShowHeatmapToggle(!showHeatmapToggle)}
-                  >
-                    <Text style={styles.panelToggleBtnText}>
-                      {showHeatmapToggle ? "Show Composite" : "Show Heatmap"}
-                    </Text>
-                  </TouchableOpacity>
-                )}
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 4 }}>
+                <Text style={styles.imagePanelLabel}>3. SegFormer Flood Segmentation</Text>
+                <View style={{ flexDirection: 'row', gap: 4 }}>
+                  {opticalOnlyB64 && (
+                    <TouchableOpacity 
+                      style={[styles.panelToggleBtn, showOpticalOnlyToggle && { backgroundColor: '#dbeafe' }]}
+                      onPress={() => setShowOpticalOnlyToggle(!showOpticalOnlyToggle)}
+                    >
+                      <Text style={styles.panelToggleBtnText}>
+                        {showOpticalOnlyToggle ? "Show SAR+Optical Fusion" : "Compare Optical-Only"}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  {(segmentationCompositeB64 || probabilityHeatmapB64) && (
+                    <TouchableOpacity 
+                      style={styles.panelToggleBtn}
+                      onPress={() => setShowHeatmapToggle(!showHeatmapToggle)}
+                    >
+                      <Text style={styles.panelToggleBtnText}>
+                        {showHeatmapToggle ? "Show Composite" : "Show Heatmap"}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
               </View>
-              {showHeatmapToggle ? (
+              {showOpticalOnlyToggle && opticalOnlyB64 ? (
+                <Image source={{ uri: opticalOnlyB64 }} style={styles.panelImage} />
+              ) : showHeatmapToggle ? (
                 probabilityHeatmapB64 ? (
                   <Image source={{ uri: probabilityHeatmapB64 }} style={styles.panelImage} />
                 ) : (
@@ -953,9 +1007,59 @@ export const MapView: React.FC<MapViewProps> = ({ onLocationSelected, lastDetect
                 )
               )}
               <Text style={styles.panelCaption}>
-                Mode: {sarB64 ? "SAR + Optical Fusion" : "Optical only"}
+                Mode: {showOpticalOnlyToggle ? "Optical-Only (Cloud-Degraded)" : sarB64 ? "SAR + Optical Fusion (ECC Registered)" : "Optical only"}
               </Text>
             </View>
+
+            {/* Panel 4: U-RNN 4D Continuous Water-Depth Nowcast (P31) */}
+            {urnnNowcastData?.horizons && (
+              <View style={[styles.imagePanel, { borderColor: '#bfdbfe', backgroundColor: '#f8fafc' }]}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
+                  <Text style={[styles.imagePanelLabel, { color: '#1e40af', marginBottom: 0 }]}>
+                    4. U-RNN 4D Continuous Depth Nowcast (0m → +60m)
+                  </Text>
+                  <View style={{ flexDirection: 'row', gap: 4 }}>
+                    {[0, 15, 30, 60].map((hz) => (
+                      <TouchableOpacity
+                        key={hz}
+                        style={[
+                          styles.panelToggleBtn,
+                          selectedUrnnHorizon === hz && { backgroundColor: '#1d4ed8' },
+                        ]}
+                        onPress={() => setSelectedUrnnHorizon(hz)}
+                      >
+                        <Text
+                          style={[
+                            styles.panelToggleBtnText,
+                            selectedUrnnHorizon === hz && { color: '#ffffff' },
+                          ]}
+                        >
+                          {hz === 0 ? '0m' : `+${hz}m`}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+
+                {urnnNowcastData.horizons[String(selectedUrnnHorizon)]?.heatmap_b64 ? (
+                  <Image
+                    source={{ uri: urnnNowcastData.horizons[String(selectedUrnnHorizon)].heatmap_b64 }}
+                    style={styles.panelImage}
+                  />
+                ) : (
+                  <View style={styles.skeletonBox}>
+                    <Text style={styles.skeletonText}>Generating 4D U-RNN depth horizon...</Text>
+                  </View>
+                )}
+
+                <Text style={[styles.panelCaption, { color: '#1e3a8a', fontWeight: '700' }]}>
+                  Horizon +{selectedUrnnHorizon}m • Peak Depth:{' '}
+                  {urnnNowcastData.horizons[String(selectedUrnnHorizon)]?.peak_depth_m ?? 0.5}m •
+                  Critical (&gt;1.0m):{' '}
+                  {urnnNowcastData.horizons[String(selectedUrnnHorizon)]?.area_critical_sq_km ?? 0.1} km²
+                </Text>
+              </View>
+            )}
           </View>
         </View>
       )}
@@ -1709,7 +1813,7 @@ const styles = StyleSheet.create({
   },
   reportHeroCard: {
     width: '100%',
-    flexDirection: 'row',
+    flexDirection: IS_COMPACT_LAYOUT ? 'column' : 'row',
     alignItems: 'stretch',
     backgroundColor: '#ffffff',
     borderRadius: 22,
@@ -1722,10 +1826,11 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.06,
     shadowRadius: 10,
     elevation: 2,
-    minHeight: 220,
+    minHeight: IS_COMPACT_LAYOUT ? undefined : 220,
   },
   reportHeroLeft: {
-    flex: 1.15,
+    flex: IS_COMPACT_LAYOUT ? 0 : 1.15,
+    width: IS_COMPACT_LAYOUT ? '100%' : undefined,
     paddingLeft: 16,
     paddingRight: 6,
     paddingTop: 16,
@@ -1815,12 +1920,14 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   reportHeroRight: {
-    flex: 0.95,
+    flex: IS_COMPACT_LAYOUT ? 0 : 0.95,
+    width: IS_COMPACT_LAYOUT ? '100%' : undefined,
+    height: IS_COMPACT_LAYOUT ? 118 : undefined,
     overflow: 'hidden',
   },
   reportHeroArt: {
     width: '100%',
-    height: '100%',
+    height: IS_COMPACT_LAYOUT ? 118 : '100%',
   },
   metricsGrid: {
     flexDirection: 'row',
@@ -1829,8 +1936,8 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   metricCard: {
-    width: '31.5%',
-    minWidth: 95,
+    width: IS_COMPACT_LAYOUT ? '48%' : '31.5%',
+    minWidth: IS_COMPACT_LAYOUT ? 0 : 95,
     backgroundColor: '#ffffff',
     borderRadius: 16,
     borderWidth: 1,

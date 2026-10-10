@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, StatusBar, SafeAreaView, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Dimensions, Platform, Linking, Animated, ImageBackground, Image } from 'react-native';
-import { Map, AlertOctagon, Cpu, Settings as SettingsIcon, Shield, Users, LogOut, Lock, User, Plus, Filter, CheckSquare, MessageSquare, PhoneCall, Bell, Mail, Compass, Eye, EyeOff, ShieldAlert, Check, PlusCircle, FileText, Home, Activity, Phone, ChevronRight, ChevronUp, ArrowLeft, MapPin, CheckCircle2 } from 'lucide-react-native';
+import { StyleSheet, View, Text, StatusBar, SafeAreaView, TouchableOpacity, TextInput, ScrollView, ActivityIndicator, Alert, Dimensions, Platform, Linking, Animated, ImageBackground, Image, Modal } from 'react-native';
+import { Map, AlertOctagon, Cpu, Settings as SettingsIcon, Shield, Users, LogOut, Lock, User, Plus, Filter, CheckSquare, MessageSquare, PhoneCall, Bell, Mail, Compass, Eye, EyeOff, ShieldAlert, Check, PlusCircle, FileText, Home, Activity, Phone, ChevronRight, ChevronUp, ArrowLeft, MapPin, CheckCircle2, Waves, Globe } from 'lucide-react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Speech from 'expo-speech';
 import * as Notifications from 'expo-notifications';
 import { MapView } from './src/components/MapView';
@@ -10,10 +11,12 @@ import { AgentPanel } from './src/components/AgentPanel';
 import { SettingsPanel } from './src/components/SettingsPanel';
 import { ChatbotPanel } from './src/components/ChatbotPanel';
 import { TriagePanel } from './src/components/TriagePanel';
+import { NowcastPanel } from './src/components/NowcastPanel';
 import { ReportViewerModal } from './src/components/ReportViewerModal';
 import { apiService, DEFAULT_API_URL, DetectionResult, CrowdReport, ShelterInfo } from './src/services/api';
+import { AppLanguage, t, DEFAULT_DEMO_PHONE_E164 } from './src/utils/i18n';
 
-type TabType = 'map' | 'report' | 'raise' | 'agent' | 'triage' | 'settings';
+type TabType = 'map' | 'report' | 'raise' | 'agent' | 'nowcast' | 'triage' | 'settings';
 
 
 type UserRole = 'none' | 'citizen' | 'official';
@@ -35,6 +38,8 @@ export default function App() {
   const [role, setRole] = useState<UserRole>('none');
   const [screenMode, setScreenMode] = useState<ScreenMode>('login');
   const [activeTab, setActiveTab] = useState<TabType>('report');
+  const [appLanguage, setAppLanguage] = useState<AppLanguage>('en');
+  const [showLangModal, setShowLangModal] = useState<boolean>(true);
   
   // Track seen complaint IDs to prevent notification loops
   const seenComplaintIdsRef = useRef<Set<number>>(new Set());
@@ -118,8 +123,8 @@ export default function App() {
   const [notification, setNotification] = useState<{ title: string; message: string; type: 'emergency' | 'warning' | 'info' } | null>(null);
   const [pushToken, setPushToken] = useState<string>('');
   
-  // Recipient email address input state (defaulted for demo convenience)
-  const [recipientEmail, setRecipientEmail] = useState<string>('rawalrajat044@gmail.com');
+  // SMTP recipient is controlled by Reciever_email in the backend .env file.
+  const [recipientEmail] = useState<string>('');
 
   const [expandedComplaintId, setExpandedComplaintId] = useState<number | null>(null);
 
@@ -155,9 +160,31 @@ export default function App() {
     }
   };
 
+  const handleSelectLanguage = async (selected: AppLanguage) => {
+    setAppLanguage(selected);
+    setShowLangModal(false);
+    try {
+      await AsyncStorage.setItem('aegis_app_language', selected);
+      if (Platform.OS === 'web') {
+        localStorage.setItem('aegis_app_language', selected);
+      }
+    } catch (e) {}
+  };
+
   useEffect(() => {
     // Initialize API Service (load custom API URL/mock state from storage)
     apiService.init().catch(err => console.log('API Service initialization failed:', err));
+
+    // Check saved language preference (P35: First-launch language modal)
+    AsyncStorage.getItem('aegis_app_language')
+      .then(savedLang => {
+        if (savedLang === 'en' || savedLang === 'hi') {
+          setAppLanguage(savedLang);
+        }
+        // Always show language modal on startup as requested by user ("before starting the app ask the user to select any language")
+        setShowLangModal(true);
+      })
+      .catch(() => setShowLangModal(true));
 
     // Restore session on page refresh
     try {
@@ -233,9 +260,9 @@ export default function App() {
       }
 
       // Trigger backend SMTP email alert to the configured recipient email
-      if (recipientEmail && recipientEmail.includes('@')) {
+      if (type === 'emergency' || type === 'warning') {
         apiService.triggerEmailAlert(recipientEmail, title, message)
-          .then(res => console.log('[SMTP Email Alert] Dispatched successfully:', res))
+          .then(res => console.log('[SMTP Email Alert] Dispatched successfully to the backend-configured recipient:', res))
           .catch(err => console.log('[SMTP Email Alert] Dispatch failed:', err));
       }
       
@@ -325,6 +352,7 @@ export default function App() {
     setActiveTab('report');
     setChatHistory([]);
     setNotification(null);
+    setShowLangModal(true);
     try {
       if (Platform.OS === 'web') {
         localStorage.removeItem('user_username');
@@ -407,13 +435,27 @@ export default function App() {
     }
   };
 
-  const handleVoiceCallTrigger = async (phoneNum: string, severity: string) => {
+  const handleVoiceCallTrigger = async (phoneNum: string, severity: string, locationName?: string) => {
+    const targetNumber = phoneNum || DEFAULT_DEMO_PHONE_E164;
     const alertMessage = `Emergency Alert: Active ${severity} water levels verified near your location. Route paths are updated. Please evacuate to the nearest safe shelter immediately.`;
     try {
-      const res = await apiService.triggerVoiceCall(phoneNum, alertMessage);
+      const res = await apiService.triggerVoiceCall(
+        targetNumber,
+        alertMessage,
+        {
+          location: locationName || `${activeLat.toFixed(2)}N, ${activeLon.toFixed(2)}E`,
+          severity,
+          language: appLanguage,
+          max_depth_m: 1.1,
+        }
+      );
       if (res.status === 'SUCCESS') {
         setExpandedComplaintId(null);
-        triggerNotification("Twilio Voice Call Outbound", `Automated warning call dialed to ${phoneNum}.`, "info");
+        triggerNotification(
+          "Twilio Voice Call Outbound",
+          `Automated ${appLanguage === 'hi' ? 'Hindi (Polly.Aditi)' : 'English (alice)'} warning call dialed to ${targetNumber}.`,
+          "info"
+        );
       }
     } catch (e) {
       Alert.alert('Error', 'Voice gateway request failed.');
@@ -447,11 +489,11 @@ export default function App() {
       const res = await apiService.triggerEmailReport(payload);
       if (res.status === 'SUCCESS') {
         setExpandedComplaintId(null);
-        triggerNotification("Email Alert Sent", `LLM Situation brief sent to: ${recipientEmail}`, "info");
+        triggerNotification("Email Alert Sent", "LLM Situation brief sent to the configured .env recipient.", "info");
         Alert.alert('RAG Email Dispatched', `The following LLM report was sent successfully:\n\n${res.report}`);
       }
-    } catch (e) {
-      Alert.alert('Error', 'Direct SMTP dispatch request failed.');
+    } catch (e: any) {
+      Alert.alert('Error', e?.message || 'Direct SMTP dispatch request failed.');
     }
   };
 
@@ -601,10 +643,79 @@ export default function App() {
     setAgreeTerms(false);
   };
 
+  // First-Launch / Pre-Login Language Selection Gate (P35: Ask user to select English or Hindi before login/starting the app)
+  const renderLanguageModal = () => (
+    <Modal visible={showLangModal} transparent animationType="fade">
+      <View style={{ flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.72)', justifyContent: 'center', alignItems: 'center', padding: 20 }}>
+        <View style={{ width: '100%', maxWidth: 400, backgroundColor: '#ffffff', borderRadius: 24, padding: 26, borderWidth: 1, borderColor: '#e2e8f0', alignItems: 'center' }}>
+          <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: '#eff6ff', justifyContent: 'center', alignItems: 'center', marginBottom: 12, borderWidth: 1, borderColor: '#bfdbfe' }}>
+            <Globe size={28} color="#2563eb" />
+          </View>
+          <View style={{ backgroundColor: '#ecfdf5', borderWidth: 1, borderColor: '#a7f3d0', paddingHorizontal: 10, paddingVertical: 3, borderRadius: 999, marginBottom: 8 }}>
+            <Text style={{ fontSize: 10, fontWeight: '800', color: '#059669' }}>STEP 1 OF 2 • BEFORE LOGIN</Text>
+          </View>
+          <Text style={{ fontSize: 18, fontWeight: '800', color: '#0f172a', textAlign: 'center', marginBottom: 6 }}>
+            {t(appLanguage, 'langModalTitle')}
+          </Text>
+          <Text style={{ fontSize: 12, color: '#64748b', textAlign: 'center', lineHeight: 18, marginBottom: 18 }}>
+            {t(appLanguage, 'langModalSubtitle')}
+          </Text>
+
+          <View style={{ width: '100%', gap: 10 }}>
+            <TouchableOpacity
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                paddingVertical: 14,
+                paddingHorizontal: 16,
+                borderRadius: 14,
+                borderWidth: 2,
+                borderColor: appLanguage === 'en' ? '#2563eb' : '#e2e8f0',
+                backgroundColor: appLanguage === 'en' ? '#eff6ff' : '#f8fafc',
+              }}
+              onPress={() => handleSelectLanguage('en')}
+              activeOpacity={0.85}
+            >
+              <View>
+                <Text style={{ fontSize: 15, fontWeight: '800', color: '#0f172a' }}>🇬🇧 English</Text>
+                <Text style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>Full App, Alerts & Voice Calls in English</Text>
+              </View>
+              <Text style={{ fontSize: 12, fontWeight: '800', color: '#2563eb' }}>Continue →</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                paddingVertical: 14,
+                paddingHorizontal: 16,
+                borderRadius: 14,
+                borderWidth: 2,
+                borderColor: appLanguage === 'hi' ? '#059669' : '#e2e8f0',
+                backgroundColor: appLanguage === 'hi' ? '#ecfdf5' : '#f8fafc',
+              }}
+              onPress={() => handleSelectLanguage('hi')}
+              activeOpacity={0.85}
+            >
+              <View>
+                <Text style={{ fontSize: 15, fontWeight: '800', color: '#0f172a' }}>🇮🇳 हिन्दी (Hindi)</Text>
+                <Text style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>पूरा ऐप, अलर्ट और वॉयस कॉल हिंदी में</Text>
+              </View>
+              <Text style={{ fontSize: 12, fontWeight: '800', color: '#059669' }}>आगे बढ़ें →</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
   if (role === 'none') {
     return (
       <View style={{ flex: 1, backgroundColor: '#8bbfe8' }}>
         <StatusBar barStyle="dark-content" backgroundColor="transparent" translucent />
+        {renderLanguageModal()}
         <ImageBackground
           source={require('./assets/flood-auth-background.png')}
           resizeMode="cover"
@@ -654,14 +765,36 @@ export default function App() {
                   )}
                 </TouchableOpacity>
 
+                {/* Pre-Login Language Switcher Pill on Auth Card */}
+                <View style={{ alignItems: 'center', marginBottom: 8 }}>
+                  <TouchableOpacity
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      backgroundColor: '#eff6ff',
+                      borderWidth: 1,
+                      borderColor: '#bfdbfe',
+                      paddingHorizontal: 12,
+                      paddingVertical: 5,
+                      borderRadius: 999,
+                      gap: 6,
+                    }}
+                    onPress={() => setShowLangModal(true)}
+                    activeOpacity={0.8}
+                  >
+                    <Globe size={13} color="#2563eb" />
+                    <Text style={{ fontSize: 11.5, fontWeight: '800', color: '#1d4ed8' }}>
+                      {appLanguage === 'hi' ? '🇮🇳 भाषा: हिन्दी (बदलें)' : '🇬🇧 Language: English (Change)'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
                 {/* Title */}
               <Text style={authStyles.formTitle}>
-                {screenMode === 'login' ? 'Secure sign in' : 'Create your account'}
+                {screenMode === 'login' ? t(appLanguage, 'loginTitle') : t(appLanguage, 'signupTitle')}
               </Text>
               <Text style={authStyles.formSubtitle}>
-                {screenMode === 'login'
-                  ? 'Access your Aegis flood-response workspace.'
-                  : 'Create your access for the Aegis response workspace.'}
+                {screenMode === 'login' ? t(appLanguage, 'loginSubtitle') : t(appLanguage, 'signupSubtitle')}
               </Text>
 
               {/* Error */}
@@ -672,7 +805,7 @@ export default function App() {
               ) : null}
 
               {/* Email / Username */}
-              <Text style={authStyles.fieldLabel}>Email</Text>
+              <Text style={authStyles.fieldLabel}>{t(appLanguage, 'emailLabel')}</Text>
               <View style={authStyles.inputRow}>
                 <Mail size={16} color="#a0a0b8" style={{ marginRight: 10 }} />
                 <TextInput
@@ -687,7 +820,7 @@ export default function App() {
               </View>
 
               {/* Password */}
-              <Text style={authStyles.fieldLabel}>Password</Text>
+              <Text style={authStyles.fieldLabel}>{t(appLanguage, 'passwordLabel')}</Text>
               <View style={authStyles.inputRow}>
                 <Lock size={16} color="#a0a0b8" style={{ marginRight: 10 }} />
                 <TextInput
@@ -708,7 +841,7 @@ export default function App() {
               {screenMode === 'signup' && (
                 <>
                   {/* Confirm Password */}
-                  <Text style={authStyles.fieldLabel}>Confirm Password</Text>
+                  <Text style={authStyles.fieldLabel}>{t(appLanguage, 'confirmPasswordLabel')}</Text>
                   <View style={authStyles.inputRow}>
                     <Lock size={16} color="#a0a0b8" style={{ marginRight: 10 }} />
                     <TextInput
@@ -726,7 +859,7 @@ export default function App() {
                   </View>
 
                   {/* Phone */}
-                  <Text style={authStyles.fieldLabel}>Phone Number</Text>
+                  <Text style={authStyles.fieldLabel}>{t(appLanguage, 'phoneLabel')}</Text>
                   <View style={authStyles.inputRow}>
                     <Phone size={16} color="#a0a0b8" style={{ marginRight: 10 }} />
                     <TextInput
@@ -740,7 +873,7 @@ export default function App() {
                   </View>
 
                   {/* Role Selector */}
-                  <Text style={authStyles.fieldLabel}>Profile Access Role</Text>
+                  <Text style={authStyles.fieldLabel}>{t(appLanguage, 'roleSelectLabel')}</Text>
                   <View style={authStyles.roleRow}>
                     <TouchableOpacity
                       style={[authStyles.roleBtn, authRole === 'citizen' && authStyles.roleBtnActive]}
@@ -749,7 +882,7 @@ export default function App() {
                     >
                       <Users size={14} color={authRole === 'citizen' ? '#ffffff' : '#8b7bc8'} style={{ marginRight: 6 }} />
                       <Text style={[authStyles.roleBtnText, authRole === 'citizen' && authStyles.roleBtnTextActive]}>
-                        Citizen
+                        {t(appLanguage, 'roleCitizen')}
                       </Text>
                     </TouchableOpacity>
                     <TouchableOpacity
@@ -759,7 +892,7 @@ export default function App() {
                     >
                       <Shield size={14} color={authRole === 'official' ? '#ffffff' : '#8b7bc8'} style={{ marginRight: 6 }} />
                       <Text style={[authStyles.roleBtnText, authRole === 'official' && authStyles.roleBtnTextActive]}>
-                        Official
+                        {t(appLanguage, 'roleOfficial')}
                       </Text>
                     </TouchableOpacity>
                   </View>
@@ -791,13 +924,13 @@ export default function App() {
                     <View style={[authStyles.checkbox, rememberMe && authStyles.checkboxChecked]}>
                       {rememberMe && <Check size={12} color="#ffffff" />}
                     </View>
-                    <Text style={authStyles.checkLabel}>Remember me</Text>
+                    <Text style={authStyles.checkLabel}>{t(appLanguage, 'rememberMe')}</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     activeOpacity={0.7}
                     onPress={() => Alert.alert('Password recovery', 'Contact your Aegis system administrator to reset your password.')}
                   >
-                    <Text style={authStyles.forgotText}>Forgot Password?</Text>
+                    <Text style={authStyles.forgotText}>{t(appLanguage, 'forgotPassword')}</Text>
                   </TouchableOpacity>
                 </View>
               )}
@@ -819,7 +952,7 @@ export default function App() {
                     <ActivityIndicator size="small" color="#ffffff" />
                   ) : (
                     <Text style={authStyles.submitText}>
-                      {screenMode === 'login' ? 'Log In' : 'Sign Up'}
+                      {screenMode === 'login' ? t(appLanguage, 'loginBtn') : t(appLanguage, 'signupBtn')}
                     </Text>
                   )}
                 </LinearGradient>
@@ -828,7 +961,7 @@ export default function App() {
               {/* Divider */}
               <View style={authStyles.dividerRow}>
                 <View style={authStyles.dividerLine} />
-                <Text style={authStyles.dividerText}>or continue with</Text>
+                <Text style={authStyles.dividerText}>{t(appLanguage, 'orContinueWith')}</Text>
                 <View style={authStyles.dividerLine} />
               </View>
 
@@ -855,11 +988,11 @@ export default function App() {
               {/* Toggle Link */}
               <View style={authStyles.toggleRow}>
                 <Text style={authStyles.toggleText}>
-                  {screenMode === 'login' ? "Don't have an account? " : 'Already have an account? '}
+                  {screenMode === 'login' ? t(appLanguage, 'noAccountText') : t(appLanguage, 'haveAccountText')}
                 </Text>
                 <TouchableOpacity onPress={toggleScreenMode} activeOpacity={0.7}>
                   <Text style={authStyles.toggleLink}>
-                    {screenMode === 'login' ? 'Sign Up' : 'Log In'}
+                    {screenMode === 'login' ? t(appLanguage, 'signupBtn') : t(appLanguage, 'loginBtn')}
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -872,7 +1005,7 @@ export default function App() {
               >
                 <SettingsIcon size={12} color="#a0a0b8" style={{ marginRight: 4 }} />
                 <Text style={authStyles.serverToggleText}>
-                  {showServerConfig ? 'Hide Server Settings' : 'Server Connection Settings'}
+                  {showServerConfig ? t(appLanguage, 'serverSettingsHide') : t(appLanguage, 'serverSettingsShow')}
                 </Text>
               </TouchableOpacity>
 
@@ -922,6 +1055,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeContainer}>
       <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
+      {renderLanguageModal()}
       
       {/* Slide-Down glassmorphic banner */}
       {notification && (
@@ -947,14 +1081,24 @@ export default function App() {
             <Shield size={20} color="#ffffff" />
           </View>
           <View style={{ marginLeft: 10 }}>
-            <Text style={dashStyles.headerBrand}>Aegis</Text>
-            <Text style={dashStyles.headerSlogan}>Safer Today. Stronger Tomorrow.</Text>
+            <Text style={dashStyles.headerBrand}>{t(appLanguage, 'appTitle')}</Text>
+            <Text style={dashStyles.headerSlogan}>{t(appLanguage, 'appSlogan')}</Text>
           </View>
         </View>
         <View style={dashStyles.headerRight}>
+          {/* Language Switcher Pill (P35) */}
+          <TouchableOpacity
+            style={[dashStyles.rolePill, { borderColor: '#cbd5e1', backgroundColor: '#f8fafc', marginRight: 6 }]}
+            onPress={() => handleSelectLanguage(appLanguage === 'en' ? 'hi' : 'en')}
+            activeOpacity={0.75}
+          >
+            <Text style={[dashStyles.rolePillText, { color: '#0f172a' }]}>
+              {appLanguage === 'en' ? '🇬🇧 EN | हिं' : '🇮🇳 हिं | EN'}
+            </Text>
+          </TouchableOpacity>
           <View style={[dashStyles.rolePill, { borderColor: role === 'citizen' ? '#10b981' : '#2563eb', backgroundColor: role === 'citizen' ? '#ecfdf5' : '#eff6ff' }]}>
             <Text style={[dashStyles.rolePillText, { color: role === 'citizen' ? '#059669' : '#2563eb' }]}>
-              {role.toUpperCase()}
+              {role === 'citizen' ? t(appLanguage, 'roleCitizen') : t(appLanguage, 'roleOfficial')}
             </Text>
           </View>
           <TouchableOpacity 
@@ -984,12 +1128,13 @@ export default function App() {
             onLocationSelected={handleLocationSelected}
             initialLat={activeLat}
             initialLon={activeLon}
+            language={appLanguage}
           />
         )}
 
         {/* Dedicated Page to Raise Ground Issues ONLY */}
         {activeTab === 'raise' && (
-          <ReportForm username={currentUser} onReported={fetchDashboardData} />
+          <ReportForm username={currentUser} onReported={fetchDashboardData} language={appLanguage} />
         )}
 
         {activeTab === 'report' && (
@@ -1021,7 +1166,7 @@ export default function App() {
                   <View style={[dashStyles.metricIconBadge, { backgroundColor: '#dcfce7' }]}>
                     <Map size={15} color="#16a34a" />
                   </View>
-                  <Text style={dashStyles.metricLabel}>Active Regions</Text>
+                  <Text style={dashStyles.metricLabel}>{t(appLanguage, 'activeRegions')}</Text>
                   <Text style={dashStyles.metricValue}>{Object.keys(stats.location_groups).length || 12}</Text>
                   <Text style={[dashStyles.metricTrend, { color: '#16a34a' }]}>↑ +2 new</Text>
                 </View>
@@ -1030,7 +1175,7 @@ export default function App() {
                   <View style={[dashStyles.metricIconBadge, { backgroundColor: '#fee2e2' }]}>
                     <AlertOctagon size={15} color="#ef4444" />
                   </View>
-                  <Text style={dashStyles.metricLabel}>Active Alerts</Text>
+                  <Text style={dashStyles.metricLabel}>{t(appLanguage, 'activeAlerts')}</Text>
                   <Text style={dashStyles.metricValue}>{stats.total_active || 3}</Text>
                   <Text style={[dashStyles.metricTrend, { color: '#dc2626' }]}>↑ +1</Text>
                 </View>
@@ -1039,7 +1184,7 @@ export default function App() {
                   <View style={[dashStyles.metricIconBadge, { backgroundColor: '#ede9fe' }]}>
                     <Shield size={15} color="#7c3aed" />
                   </View>
-                  <Text style={dashStyles.metricLabel}>People at Risk</Text>
+                  <Text style={dashStyles.metricLabel}>{t(appLanguage, 'peopleAtRisk')}</Text>
                   <Text style={dashStyles.metricValue}>
                     {lastResult?.impact?.population ? lastResult.impact.population.toLocaleString() : '2,480'}
                   </Text>
@@ -1060,9 +1205,9 @@ export default function App() {
                       <Map size={15} color="#0284c7" />
                     </View>
                     <View style={{ flex: 1, marginLeft: 8 }}>
-                      <Text style={dashStyles.mapCardTitle}>Interactive Map</Text>
+                      <Text style={dashStyles.mapCardTitle}>{t(appLanguage, 'interactiveMapTitle')}</Text>
                       <Text style={dashStyles.mapCardDesc} numberOfLines={2}>
-                        Explore real-time disaster data & shelter locations
+                        {t(appLanguage, 'interactiveMapDesc')}
                       </Text>
                     </View>
                     <View style={dashStyles.miniArrowBtn}>
@@ -1076,7 +1221,7 @@ export default function App() {
                       resizeMode="cover"
                     />
                     <View style={dashStyles.mapUpdatedPill}>
-                      <Text style={dashStyles.mapUpdatedText}>Last updated: 2 mins ago</Text>
+                      <Text style={dashStyles.mapUpdatedText}>{t(appLanguage, 'lastUpdated2m')}</Text>
                     </View>
                   </View>
                 </TouchableOpacity>
@@ -1092,12 +1237,12 @@ export default function App() {
                     <View style={dashStyles.actionIconBadgeRed}>
                       <AlertOctagon size={16} color="#ef4444" />
                     </View>
-                    <Text style={dashStyles.actionTitle}>Raise Ground Issue</Text>
+                    <Text style={dashStyles.actionTitle}>{t(appLanguage, 'raiseGroundIssueTitle')}</Text>
                     <Text style={dashStyles.actionDesc} numberOfLines={2}>
-                      Report a new flood, rescue or emergency issue.
+                      {t(appLanguage, 'raiseGroundIssueDesc')}
                     </Text>
                     <View style={dashStyles.actionBtnRed}>
-                      <Text style={dashStyles.actionBtnText}>Report Now →</Text>
+                      <Text style={dashStyles.actionBtnText}>{t(appLanguage, 'reportNowBtn')}</Text>
                     </View>
                   </TouchableOpacity>
 
@@ -1110,12 +1255,12 @@ export default function App() {
                     <View style={dashStyles.actionIconBadgeGreen}>
                       <Activity size={16} color="#10b981" />
                     </View>
-                    <Text style={dashStyles.actionTitle}>Aegis AI Assistant</Text>
+                    <Text style={dashStyles.actionTitle}>{t(appLanguage, 'aiAssistantTitle')}</Text>
                     <Text style={dashStyles.actionDesc} numberOfLines={2}>
-                      Get instant insights on risks, relief and safety.
+                      {t(appLanguage, 'aiAssistantDesc')}
                     </Text>
                     <View style={dashStyles.actionBtnGreen}>
-                      <Text style={dashStyles.actionBtnText}>Chat Now →</Text>
+                      <Text style={dashStyles.actionBtnText}>{t(appLanguage, 'chatNowBtn')}</Text>
                     </View>
                   </TouchableOpacity>
                 </View>
@@ -1131,9 +1276,9 @@ export default function App() {
                   <FileText size={18} color="#2563eb" />
                 </View>
                 <View style={dashStyles.briefTextCol}>
-                  <Text style={dashStyles.briefTitle}>Active Regional Disaster Brief</Text>
+                  <Text style={dashStyles.briefTitle}>{t(appLanguage, 'regionalBriefTitle')}</Text>
                   <Text style={dashStyles.briefDesc}>
-                    View the latest updates, forecasts and impact reports for selected regions.
+                    {t(appLanguage, 'regionalBriefDesc')}
                   </Text>
                 </View>
                 <ChevronRight size={18} color="#94a3b8" />
@@ -1149,13 +1294,13 @@ export default function App() {
                       <AlertOctagon size={16} color="#ef4444" />
                     </View>
                     <View style={dashStyles.panelCardTextCol}>
-                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>Personal Alert Warning Logs</Text>
-                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>Proximity hazards & real-time risk alerts for your sector</Text>
+                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>{t(appLanguage, 'personalAlertLogsTitle')}</Text>
+                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>{t(appLanguage, 'personalAlertLogsSub')}</Text>
                     </View>
                   </View>
                   <View style={[dashStyles.panelBadgePill, { backgroundColor: (lastResult && (lastResult.severity === 'CRITICAL' || lastResult.severity === 'HIGH')) ? '#fef2f2' : '#ecfdf5', borderColor: (lastResult && (lastResult.severity === 'CRITICAL' || lastResult.severity === 'HIGH')) ? '#fecaca' : '#a7f3d0' }]}>
                     <Text style={[dashStyles.panelBadgeText, { color: (lastResult && (lastResult.severity === 'CRITICAL' || lastResult.severity === 'HIGH')) ? '#dc2626' : '#059669' }]}>
-                      {(lastResult && (lastResult.severity === 'CRITICAL' || lastResult.severity === 'HIGH')) ? 'CRITICAL' : 'ALL CLEAR'}
+                      {(lastResult && (lastResult.severity === 'CRITICAL' || lastResult.severity === 'HIGH')) ? 'CRITICAL' : t(appLanguage, 'allClearBadge')}
                     </Text>
                   </View>
                 </View>
@@ -1182,9 +1327,9 @@ export default function App() {
                 ) : (
                   <View style={dashStyles.emptyCardState}>
                     <Shield size={22} color="#10b981" />
-                    <Text style={dashStyles.emptyStateTitle}>All Clear — No immediate hazards</Text>
+                    <Text style={dashStyles.emptyStateTitle}>{t(appLanguage, 'allClearTitle')}</Text>
                     <Text style={dashStyles.emptyStateDesc}>
-                      MirEye Earth satellite telemetry & sensor models report nominal safety conditions in your sector.
+                      {t(appLanguage, 'allClearDesc')}
                     </Text>
                   </View>
                 )}
@@ -1198,8 +1343,8 @@ export default function App() {
                       <CheckSquare size={16} color="#2563eb" />
                     </View>
                     <View style={dashStyles.panelCardTextCol}>
-                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>Personal Ground Warning Log</Text>
-                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>Track reports and emergency alerts you have raised</Text>
+                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>{t(appLanguage, 'personalGroundLogTitle')}</Text>
+                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>{t(appLanguage, 'personalGroundLogSub')}</Text>
                     </View>
                   </View>
                   <TouchableOpacity 
@@ -1207,7 +1352,7 @@ export default function App() {
                     onPress={() => setActiveTab('raise')}
                     activeOpacity={0.8}
                   >
-                    <Text style={dashStyles.newReportLinkText}>+ File Report</Text>
+                    <Text style={dashStyles.newReportLinkText}>{t(appLanguage, 'fileReportBtn')}</Text>
                   </TouchableOpacity>
                 </View>
 
@@ -1218,9 +1363,9 @@ export default function App() {
                 ) : complaints.filter(c => c.username === currentUser).length === 0 ? (
                   <View style={dashStyles.emptyCardState}>
                     <FileText size={22} color="#94a3b8" />
-                    <Text style={dashStyles.emptyStateTitle}>You haven't submitted any reports yet</Text>
+                    <Text style={dashStyles.emptyStateTitle}>{t(appLanguage, 'noReportsTitle')}</Text>
                     <Text style={dashStyles.emptyStateDesc}>
-                      Encountered high water, damaged infrastructure, or blocked access? Tap '+ File Report' above.
+                      {t(appLanguage, 'noReportsDesc')}
                     </Text>
                   </View>
                 ) : (
@@ -1256,12 +1401,12 @@ export default function App() {
                       <Users size={16} color="#7c3aed" />
                     </View>
                     <View style={dashStyles.panelCardTextCol}>
-                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>Active Community Reports Feed</Text>
-                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>Verified crowd-sourced reports submitted across your area</Text>
+                      <Text style={dashStyles.panelCardTitle} numberOfLines={1}>{t(appLanguage, 'communityFeedTitle')}</Text>
+                      <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>{t(appLanguage, 'communityFeedSub')}</Text>
                     </View>
                   </View>
                   <View style={[dashStyles.panelBadgePill, { backgroundColor: '#f5f3ff', borderColor: '#ddd6fe' }]}>
-                    <Text style={[dashStyles.panelBadgeText, { color: '#7c3aed' }]}>LIVE FEED</Text>
+                    <Text style={[dashStyles.panelBadgeText, { color: '#7c3aed' }]}>{t(appLanguage, 'liveFeedBadge')}</Text>
                   </View>
                 </View>
 
@@ -1331,7 +1476,7 @@ export default function App() {
                     <View style={[dashStyles.metricIconBadge, { backgroundColor: '#dcfce7' }]}>
                       <Map size={15} color="#16a34a" />
                     </View>
-                    <Text style={dashStyles.metricLabel}>Active Regions</Text>
+                    <Text style={dashStyles.metricLabel}>{t(appLanguage, 'activeRegions')}</Text>
                     <Text style={dashStyles.metricValue}>{Object.keys(stats.location_groups).length || 12}</Text>
                     <Text style={[dashStyles.metricTrend, { color: '#16a34a' }]}>↑ +2 new</Text>
                   </View>
@@ -1340,7 +1485,7 @@ export default function App() {
                     <View style={[dashStyles.metricIconBadge, { backgroundColor: '#fee2e2' }]}>
                       <AlertOctagon size={15} color="#ef4444" />
                     </View>
-                    <Text style={dashStyles.metricLabel}>Active Warnings</Text>
+                    <Text style={dashStyles.metricLabel}>{t(appLanguage, 'activeWarnings')}</Text>
                     <Text style={dashStyles.metricValue}>{stats.total_active || 3}</Text>
                     <Text style={[dashStyles.metricTrend, { color: '#dc2626' }]}>↑ +1 pending</Text>
                   </View>
@@ -1349,7 +1494,7 @@ export default function App() {
                     <View style={[dashStyles.metricIconBadge, { backgroundColor: '#dbeafe' }]}>
                       <CheckCircle2 size={15} color="#2563eb" />
                     </View>
-                    <Text style={dashStyles.metricLabel}>Actioned</Text>
+                    <Text style={dashStyles.metricLabel}>{t(appLanguage, 'actionedLabel')}</Text>
                     <Text style={dashStyles.metricValue}>{stats.total_resolved || 0}</Text>
                     <Text style={[dashStyles.metricTrend, { color: '#2563eb' }]}>✓ Resolved</Text>
                   </View>
@@ -1368,9 +1513,9 @@ export default function App() {
                         <Map size={15} color="#0284c7" />
                       </View>
                       <View style={{ flex: 1, marginLeft: 8 }}>
-                        <Text style={dashStyles.mapCardTitle}>Interactive Map</Text>
+                        <Text style={dashStyles.mapCardTitle}>{t(appLanguage, 'interactiveMapTitle')}</Text>
                         <Text style={dashStyles.mapCardDesc} numberOfLines={2}>
-                          Explore real-time disaster data & shelter locations
+                          {t(appLanguage, 'interactiveMapDesc')}
                         </Text>
                       </View>
                       <View style={dashStyles.miniArrowBtn}>
@@ -1384,7 +1529,7 @@ export default function App() {
                         resizeMode="cover"
                       />
                       <View style={dashStyles.mapUpdatedPill}>
-                        <Text style={dashStyles.mapUpdatedText}>Last updated: 2 mins ago</Text>
+                        <Text style={dashStyles.mapUpdatedText}>{t(appLanguage, 'lastUpdated2m')}</Text>
                       </View>
                     </View>
                   </TouchableOpacity>
@@ -1400,12 +1545,12 @@ export default function App() {
                       <View style={dashStyles.actionIconBadgeBlue}>
                         <CheckCircle2 size={16} color="#2563eb" />
                       </View>
-                      <Text style={dashStyles.actionTitle}>Action Taken Queue</Text>
+                      <Text style={dashStyles.actionTitle}>{t(appLanguage, 'actionTakenQueueTitle')}</Text>
                       <Text style={dashStyles.actionDesc} numberOfLines={2}>
-                        Triage, verify & dispatch official response to field reports.
+                        {t(appLanguage, 'actionTakenQueueDesc')}
                       </Text>
                       <View style={dashStyles.actionBtnBlue}>
-                        <Text style={dashStyles.actionBtnText}>Take Action →</Text>
+                        <Text style={dashStyles.actionBtnText}>{t(appLanguage, 'takeActionBtn')}</Text>
                       </View>
                     </TouchableOpacity>
 
@@ -1418,12 +1563,12 @@ export default function App() {
                       <View style={dashStyles.actionIconBadgeGreen}>
                         <Cpu size={16} color="#10b981" />
                       </View>
-                      <Text style={dashStyles.actionTitle}>AI Agent Panel</Text>
+                      <Text style={dashStyles.actionTitle}>{t(appLanguage, 'aiAgentPanelTitle')}</Text>
                       <Text style={dashStyles.actionDesc} numberOfLines={2}>
-                        Trigger autonomous monitoring cycle checks and view trace logs.
+                        {t(appLanguage, 'aiAgentPanelDesc')}
                       </Text>
                       <View style={dashStyles.actionBtnGreen}>
-                        <Text style={dashStyles.actionBtnText}>Launch Agent →</Text>
+                        <Text style={dashStyles.actionBtnText}>{t(appLanguage, 'launchAgentBtn')}</Text>
                       </View>
                     </TouchableOpacity>
                   </View>
@@ -1439,9 +1584,9 @@ export default function App() {
                     <FileText size={18} color="#2563eb" />
                   </View>
                   <View style={dashStyles.briefTextCol}>
-                    <Text style={dashStyles.briefTitle}>Active Regional Disaster Brief</Text>
+                    <Text style={dashStyles.briefTitle}>{t(appLanguage, 'regionalBriefTitle')}</Text>
                     <Text style={dashStyles.briefDesc}>
-                      View the latest updates, forecasts and impact reports for selected regions.
+                      {t(appLanguage, 'regionalBriefDesc')}
                     </Text>
                   </View>
                   <ChevronRight size={18} color="#94a3b8" />
@@ -1458,8 +1603,8 @@ export default function App() {
                         <ShieldAlert size={16} color="#2563eb" />
                       </View>
                       <View style={dashStyles.panelCardTextCol}>
-                        <Text style={dashStyles.panelCardTitle} numberOfLines={1}>Field Incident Triage & Action Taken</Text>
-                        <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>Verified citizen distress reports requiring official response</Text>
+                        <Text style={dashStyles.panelCardTitle} numberOfLines={1}>{t(appLanguage, 'fieldTriageTitle')}</Text>
+                        <Text style={dashStyles.panelCardSubtitle} numberOfLines={1}>{t(appLanguage, 'fieldTriageSub')}</Text>
                       </View>
                     </View>
                     <TouchableOpacity 
@@ -1487,7 +1632,7 @@ export default function App() {
 
                   {/* Queue Status Filter Pills */}
                   <View style={dashStyles.queueFilterRow}>
-                    <Text style={{ fontSize: 10.5, color: '#64748b', fontWeight: '600', marginRight: 4 }}>Filter Status:</Text>
+                    <Text style={{ fontSize: 10.5, color: '#64748b', fontWeight: '600', marginRight: 4 }}>{t(appLanguage, 'filterStatusLabel')}</Text>
                     {['all', 'pending', 'resolved'].map(st => (
                       <TouchableOpacity 
                         key={st} 
@@ -1540,7 +1685,15 @@ export default function App() {
                             </View>
                           </View>
 
-                          <Text style={[dashStyles.modernLogDesc, { fontSize: 11.5, color: '#334155', marginBottom: 4 }]}>{c.description}</Text>
+                           <Text style={[dashStyles.modernLogDesc, { fontSize: 11.5, color: '#334155', marginBottom: 4 }]}>{c.description}</Text>
+                          {c.image_b64 ? (
+                            <View style={{ marginBottom: 8, borderRadius: 10, overflow: 'hidden', borderWidth: 1, borderColor: '#cbd5e1' }}>
+                              <Image source={{ uri: c.image_b64 }} style={{ width: '100%', height: 120 }} resizeMode="cover" />
+                              <View style={{ backgroundColor: 'rgba(15, 23, 42, 0.72)', paddingHorizontal: 8, paddingVertical: 3 }}>
+                                <Text style={{ color: '#ffffff', fontSize: 9.5, fontWeight: '700' }}>📷 Attached Ground Photo Verification</Text>
+                              </View>
+                            </View>
+                          ) : null}
                           <Text style={{ fontSize: 9.5, color: '#64748b', marginBottom: 8 }}>
                             👤 Reporter: @{c.username} • 🕒 {formattedTime} • Status: <Text style={{ fontWeight: '700', color: c.status === 'resolved' ? '#059669' : '#d97706' }}>{c.status?.toUpperCase()}</Text>
                           </Text>
@@ -1585,10 +1738,10 @@ export default function App() {
 
                                   <TouchableOpacity 
                                     style={styles.actionMenuItem}
-                                    onPress={() => handleVoiceCallTrigger("+917678656930", c.severity)}
+                                    onPress={() => handleVoiceCallTrigger(DEFAULT_DEMO_PHONE_E164, c.severity, displayPlace)}
                                   >
                                     <PhoneCall size={14} color="#dc2626" />
-                                    <Text style={styles.actionMenuText}>📞 Trigger Twilio Voice Alert Call</Text>
+                                    <Text style={styles.actionMenuText}>📞 Trigger Twilio Voice Alert Call (+917678656930)</Text>
                                   </TouchableOpacity>
 
                                   <TouchableOpacity 
@@ -1649,6 +1802,16 @@ export default function App() {
             activeLon={activeLon} 
             onNavigateToMap={() => setActiveTab('map')}
             onOpenReportModal={() => setShowReportModal(true)}
+            lang={appLanguage}
+          />
+        )}
+
+        {activeTab === 'nowcast' && (
+          <NowcastPanel
+            lat={activeLat}
+            lon={activeLon}
+            language={appLanguage}
+            lastDetectionNowcast={(lastResult as any)?.urnn_nowcast}
           />
         )}
 
@@ -1689,17 +1852,16 @@ export default function App() {
         })}
       />
 
-      {/* Navigation Tab Bar */}
-      {/* Modern Floating Bottom Navigation Bar (Image 1 Inspiration) */}
+      {/* Navigation Tab Bar — 6 Tabs including 4D Nowcast (P32, P35) */}
       <View style={dashStyles.tabBar}>
         <TouchableOpacity 
           style={dashStyles.tabItem}
           onPress={() => setActiveTab('report')}
           activeOpacity={0.7}
         >
-          <Home size={22} color={activeTab === 'report' ? '#059669' : '#94a3b8'} />
+          <Home size={20} color={activeTab === 'report' ? '#059669' : '#94a3b8'} />
           <Text style={[dashStyles.tabLabel, activeTab === 'report' && dashStyles.tabLabelActive]}>
-            Home
+            {t(appLanguage, 'tabHome')}
           </Text>
         </TouchableOpacity>
 
@@ -1708,9 +1870,20 @@ export default function App() {
           onPress={() => setActiveTab('map')}
           activeOpacity={0.7}
         >
-          <Map size={22} color={activeTab === 'map' ? '#059669' : '#94a3b8'} />
+          <Map size={20} color={activeTab === 'map' ? '#059669' : '#94a3b8'} />
           <Text style={[dashStyles.tabLabel, activeTab === 'map' && dashStyles.tabLabelActive]}>
-            Map
+            {t(appLanguage, 'tabMap')}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={dashStyles.tabItem}
+          onPress={() => setActiveTab('nowcast')}
+          activeOpacity={0.7}
+        >
+          <Waves size={20} color={activeTab === 'nowcast' ? '#2563eb' : '#94a3b8'} />
+          <Text style={[dashStyles.tabLabel, activeTab === 'nowcast' && { color: '#2563eb', fontWeight: '700' }]}>
+            {t(appLanguage, 'tabNowcast')}
           </Text>
         </TouchableOpacity>
 
@@ -1719,9 +1892,9 @@ export default function App() {
           onPress={() => setActiveTab('agent')}
           activeOpacity={0.7}
         >
-          <Cpu size={22} color={activeTab === 'agent' ? '#059669' : '#94a3b8'} />
+          <Cpu size={20} color={activeTab === 'agent' ? '#059669' : '#94a3b8'} />
           <Text style={[dashStyles.tabLabel, activeTab === 'agent' && dashStyles.tabLabelActive]}>
-            AI Agent
+            {t(appLanguage, 'tabAgent')}
           </Text>
         </TouchableOpacity>
 
@@ -1731,9 +1904,9 @@ export default function App() {
             onPress={() => setActiveTab('triage')}
             activeOpacity={0.7}
           >
-            <CheckCircle2 size={22} color={activeTab === 'triage' ? '#2563eb' : '#94a3b8'} />
+            <CheckCircle2 size={20} color={activeTab === 'triage' ? '#2563eb' : '#94a3b8'} />
             <Text style={[dashStyles.tabLabel, activeTab === 'triage' && { color: '#2563eb', fontWeight: '700' }]}>
-              Action Taken
+              {t(appLanguage, 'tabTriage')}
             </Text>
           </TouchableOpacity>
         ) : (
@@ -1742,9 +1915,9 @@ export default function App() {
             onPress={() => setActiveTab('raise')}
             activeOpacity={0.7}
           >
-            <AlertOctagon size={22} color={activeTab === 'raise' ? '#059669' : '#94a3b8'} />
+            <AlertOctagon size={20} color={activeTab === 'raise' ? '#059669' : '#94a3b8'} />
             <Text style={[dashStyles.tabLabel, activeTab === 'raise' && dashStyles.tabLabelActive]}>
-              Raise Issue
+              {t(appLanguage, 'tabRaise')}
             </Text>
           </TouchableOpacity>
         )}
@@ -1754,9 +1927,9 @@ export default function App() {
           onPress={() => setActiveTab('settings')}
           activeOpacity={0.7}
         >
-          <SettingsIcon size={22} color={activeTab === 'settings' ? '#059669' : '#94a3b8'} />
+          <SettingsIcon size={20} color={activeTab === 'settings' ? '#059669' : '#94a3b8'} />
           <Text style={[dashStyles.tabLabel, activeTab === 'settings' && dashStyles.tabLabelActive]}>
-            Settings
+            {t(appLanguage, 'tabSettings')}
           </Text>
         </TouchableOpacity>
       </View>

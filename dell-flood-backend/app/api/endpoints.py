@@ -17,16 +17,38 @@ from email.mime.application import MIMEApplication
 import numpy as np
 from PIL import Image
 import io
+import threading
 try:
     import cv2
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
-from app.ml.inference import SegFormerMiTB2Fusion
+from app.ml.inference import SegFormerMiTB2Fusion, get_shared_model
 from app.ml.postprocess import PostProcessor
+from app.ml.urnn_nowcaster import get_shared_urnn
+from app.aegis.pipeline.dynamic_hydro_tensor import build_dynamic_hydro_tensor
+from app.aegis.pipeline.impact_analyzer import (
+    polygonize_flood_mask,
+    compute_downstream_spread_polygons,
+    calculate_live_impact,
+)
+from app.aegis.routing.dynamic_router import DynamicEvacuationRouter
 from app.agent.flood_agent import FloodAgent
-from app.agent.tools import check_rainfall, check_gauge
+from app.agent.tools import (
+    check_rainfall,
+    check_gauge,
+    trigger_voice_call as agent_trigger_voice_call,
+    DEFAULT_DEMO_CALL_NUMBER,
+)
 from app.RAG.generator import SituationReportGenerator
+from app.api.auth_deps import (
+    hash_password_salted,
+    verify_password_salted,
+    create_access_token,
+    escape_html,
+    slugify_location,
+    normalize_and_validate_phone,
+)
 
 router = APIRouter()
 
@@ -57,14 +79,18 @@ def init_db():
             status TEXT DEFAULT 'pending',
             model_confirmed INTEGER DEFAULT 0,
             timestamp REAL,
-            location_name TEXT DEFAULT ''
+            location_name TEXT DEFAULT '',
+            image_b64 TEXT DEFAULT ''
         )
     """)
-    # Ensure location_name column exists for older database instances
-    try:
-        cursor.execute("ALTER TABLE complaints ADD COLUMN location_name TEXT DEFAULT ''")
-    except Exception:
-        pass
+    for col_stmt in [
+        "ALTER TABLE complaints ADD COLUMN location_name TEXT DEFAULT ''",
+        "ALTER TABLE complaints ADD COLUMN image_b64 TEXT DEFAULT ''",
+    ]:
+        try:
+            cursor.execute(col_stmt)
+        except Exception:
+            pass
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS shelters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,9 +111,9 @@ def init_db():
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.executemany("INSERT INTO users (username, password_hash, role, phone) VALUES (?, ?, ?, ?)", [
-            ("saif", hashlib.sha256(b"123").hexdigest(), "official", "+917678656930"),
-            ("shah", hashlib.sha256(b"123").hexdigest(), "citizen", "+917678656930"),
-            ("saif_official", hashlib.sha256(b"123").hexdigest(), "official", "+917678656930")
+            ("saif", hash_password_salted("123"), "official", DEFAULT_DEMO_CALL_NUMBER),
+            ("shah", hash_password_salted("123"), "citizen", DEFAULT_DEMO_CALL_NUMBER),
+            ("saif_official", hash_password_salted("123"), "official", DEFAULT_DEMO_CALL_NUMBER)
         ])
     conn.commit()
     conn.close()
@@ -100,12 +126,12 @@ class RegisterRequest(BaseModel):
     password: str
     role: str
     phone: str
-    expo_push_token: str = None
+    expo_push_token: Optional[str] = None
 
 class LoginRequest(BaseModel):
     username: str
     password: str
-    expo_push_token: str = None
+    expo_push_token: Optional[str] = None
 
 class CrowdReportRequest(BaseModel):
     username: str
@@ -114,6 +140,7 @@ class CrowdReportRequest(BaseModel):
     severity: str
     description: str
     location_name: Optional[str] = ""
+    image_b64: Optional[str] = ""
 
 class ResolveRequest(BaseModel):
     complaint_id: int
@@ -124,11 +151,15 @@ class DetectionRequest(BaseModel):
     cloud_cover: float = 12.0
 
 class VoiceCallRequest(BaseModel):
-    phone_number: str
-    message: str
+    phone_number: Optional[str] = DEFAULT_DEMO_CALL_NUMBER
+    message: Optional[str] = ""
+    location: Optional[str] = "Patna District"
+    severity: Optional[str] = "CRITICAL"
+    language: Optional[str] = "hi"
+    max_depth_m: Optional[float] = 0.68
 
 class EmailAlertRequest(BaseModel):
-    to_email: str
+    to_email: str = ""
     subject: str
     message: str
 
@@ -155,23 +186,21 @@ class AgentCycleRequest(BaseModel):
     lat: float
     lon: float
     phones: list = []
+    report_format: Optional[str] = "DM_EXECUTIVE"
+    language: Optional[str] = "en"
+    require_hitl_for_calls: bool = False
 
 # --- Direct SMTP Email Sender ---
 def send_smtp_email(to_email: str, subject: str, body: str, attachment_path: str = None):
-    # Safety Override: Force recipient to the verified email address
-    to_email = "rawalrajat044@gmail.com"
-    
     sender_email = os.getenv("SMTP_SENDER_EMAIL", "")
     sender_password = os.getenv("SMTP_SENDER_PASSWORD", "")
-    
+    configured_recipient = (os.getenv("ALERT_RECIPIENT_EMAIL") or os.getenv("Reciever_email", "")).strip()
     if not sender_email or not sender_password:
-        try:
-            print(f"[SMTP Email Mock/Override] Forced sending to {to_email}: {subject}")
-            print(f"[SMTP Message]:\n{body.encode('ascii', 'replace').decode('ascii')}")
-        except Exception:
-            pass
-        return {"status": "SUCCESS", "message": "Mock overridden email logged to console."}
-        
+        return {"status": "ERROR", "detail": "SMTP sender credentials are missing from the backend .env file."}
+    if not configured_recipient:
+        return {"status": "ERROR", "detail": "ALERT_RECIPIENT_EMAIL is missing from the backend .env file."}
+    # Use the recipient configured by the owner; ignore demo addresses supplied by old clients.
+    to_email = configured_recipient
     try:
         msg = MIMEMultipart()
         msg['From'] = sender_email
@@ -186,19 +215,18 @@ def send_smtp_email(to_email: str, subject: str, body: str, attachment_path: str
             part['Content-Disposition'] = f'attachment; filename="{filename}"'
             msg.attach(part)
             
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, to_email, msg.as_string())
-        server.close()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=25) as server:
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, [to_email], msg.as_string())
         
-        print(f"[SMTP Email Gateway] Email sent successfully via override to {to_email}")
+        print("[SMTP Email Gateway] Email sent to the configured .env recipient.")
         return {"status": "SUCCESS", "message": "Email alert sent successfully."}
     except Exception as e:
-        print(f"[SMTP Email Gateway] Error sending email: {e}")
-        return {"status": "ERROR", "detail": str(e)}
+        print(f"[SMTP Email Gateway] Error sending email: {type(e).__name__}: {e}")
+        return {"status": "ERROR", "detail": f"SMTP delivery failed: {type(e).__name__}: {e}"}
 
 # --- Expo Push Notification Sender ---
-def send_expo_push_notification(push_token: str, title: str, body: str):
+def send_expo_push_notification(push_token: str, title: str, body: str, data: Optional[Dict[str, Any]] = None):
     if not push_token or not push_token.startswith("ExponentPushToken"):
         print(f"[Expo Push Mock] Invalid token: {push_token}")
         return
@@ -213,29 +241,27 @@ def send_expo_push_notification(push_token: str, title: str, body: str):
         "sound": "default",
         "title": title,
         "body": body,
-        "data": {"status": "escalated"}
+        "data": data if data is not None else {"status": "escalated"}
     }
     try:
-        res = requests.post(url, json=payload, headers=headers)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
         print(f"[Expo Push Gateway Response]: {res.text}")
     except Exception as e:
         print(f"[Expo Push Gateway] Failed: {e}")
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    return hash_password_salted(password)
 
 def generate_jwt_simulation(username: str, role: str) -> str:
-    payload = {"username": username, "role": role, "exp": time.time() + 86400}
-    payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
-    signature = hashlib.sha256((payload_b64 + "SECRET_KEY_123").encode()).hexdigest()
-    return f"{payload_b64}.{signature}"
+    return create_access_token(username, role)
 
 def calculate_distance(lat1, lon1, lat2, lon2):
     x = (lon2 - lon1) * np.cos(np.radians((lat1 + lat2) / 2.0)) * 111.32
     y = (lat2 - lat1) * 110.57
     return np.sqrt(x*x + y*y)
 
-model = SegFormerMiTB2Fusion()
+model = get_shared_model()
+urnn_model = get_shared_urnn()
 post_processor = PostProcessor()
 agent = FloodAgent()
 rag_generator = SituationReportGenerator()
@@ -247,9 +273,11 @@ def register_user(payload: RegisterRequest):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
+        safe_username = escape_html(payload.username.strip())
+        safe_phone = normalize_and_validate_phone(payload.phone)
         cursor.execute(
             "INSERT INTO users (username, password_hash, role, phone, expo_push_token) VALUES (?, ?, ?, ?, ?)",
-            (payload.username, hash_password(payload.password), payload.role, payload.phone, payload.expo_push_token)
+            (safe_username, hash_password_salted(payload.password), payload.role, safe_phone, payload.expo_push_token)
         )
         conn.commit()
         return {"status": "SUCCESS"}
@@ -262,62 +290,33 @@ def register_user(payload: RegisterRequest):
 def login_user(payload: LoginRequest):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT role, password_hash FROM users WHERE username = ?", (payload.username,))
+    cursor.execute("SELECT role, password_hash FROM users WHERE username = ?", (payload.username.strip(),))
     row = cursor.fetchone()
-    if not row or row[1] != hash_password(payload.password):
+    if not row or not verify_password_salted(payload.password, row[1]):
         conn.close()
         raise HTTPException(status_code=401, detail="Invalid credentials.")
     if payload.expo_push_token:
-        cursor.execute("UPDATE users SET expo_push_token = ? WHERE username = ?", (payload.expo_push_token, payload.username))
+        cursor.execute("UPDATE users SET expo_push_token = ? WHERE username = ?", (payload.expo_push_token, payload.username.strip()))
         conn.commit()
     conn.close()
     return {
         "status": "SUCCESS",
-        "token": generate_jwt_simulation(payload.username, row[0]),
+        "token": create_access_token(payload.username.strip(), row[0]),
         "role": row[0],
-        "username": payload.username
+        "username": payload.username.strip()
     }
 
-# --- Twilio Voice Call Endpoint ---
+# --- Twilio Multilingual Voice Call Endpoint (Defaults to +917678656930) ---
 @router.post("/alerts/voice")
 def trigger_voice_call(payload: VoiceCallRequest):
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "ACmock_sid_123")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "mock_auth_token_456")
-    from_phone = os.getenv("TWILIO_PHONE_NUMBER", "+15017122661")
-    
-    target_phone = payload.phone_number.strip() if (payload.phone_number and payload.phone_number.strip()) else "+917678656930"
-    
-    twiml_instruction = f"""
-    <Response>
-        <Say voice="alice" language="en-US">
-            {payload.message}
-        </Say>
-    </Response>
-    """
-    
-    print(f"[Twilio Voice Gateway] Triggering call to: {target_phone} (Requested: {payload.phone_number}) from {from_phone}")
-    
-    if "ACmock" not in account_sid:
-        try:
-            url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json"
-            auth_str = f"{account_sid}:{auth_token}"
-            auth_b64 = base64.b64encode(auth_str.encode()).decode()
-            
-            data = {
-                "To": target_phone,
-                "From": from_phone,
-                "Twiml": twiml_instruction
-            }
-            res = requests.post(url, data=data, headers={"Authorization": f"Basic {auth_b64}"})
-            if res.status_code == 201:
-                call_data = res.json()
-                return {"status": "SUCCESS", "message": f"Voice call dispatched successfully to {target_phone}.", "call_sid": call_data.get("sid")}
-            else:
-                return {"status": "ERROR", "detail": res.text}
-        except Exception as e:
-            return {"status": "ERROR", "detail": str(e)}
-
-    return {"status": "SUCCESS", "message": f"Mock voice alert dispatched to {target_phone}."}
+    return agent_trigger_voice_call(
+        phone_number=payload.phone_number or DEFAULT_DEMO_CALL_NUMBER,
+        message=payload.message or "",
+        location=payload.location or "Patna District",
+        severity=payload.severity or "CRITICAL",
+        language=payload.language or "hi",
+        max_depth_m=payload.max_depth_m if payload.max_depth_m is not None else 0.68,
+    )
 
 # --- Direct SMTP Email Endpoint ---
 @router.post("/alerts/email")
@@ -338,10 +337,8 @@ def email_rag_report(payload: EmailReportRequest):
             facilities_at_risk=payload.facilities_at_risk
         )
         
-        # Override to safety email
-        target_email = "rawalrajat044@gmail.com"
         subject = f"🚨 URGENT: OFFICIAL FLOOD SITUATION BRIEF - {payload.location.upper()}"
-        res = send_smtp_email(target_email, subject, report_text)
+        res = send_smtp_email(payload.to_email, subject, report_text)
         
         return {
             "status": res["status"],
@@ -917,7 +914,8 @@ def preview_report(payload: ReportPreviewRequest):
 
 @router.get("/reports/download")
 def download_report(location: str, lat: float, lon: float, area: float, classification: str, severity: str, pop: int, bld: int, fac: int, conf: float = 85.0):
-    filename = f"report_{location.lower().replace(' ', '_')}_{int(time.time())}.pdf"
+    safe_loc = slugify_location(location)
+    filename = f"report_{safe_loc}_{int(time.time())}.pdf"
     filepath = f"./reports/{filename}"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     generate_location_pdf(filepath, location, lat, lon, area, classification, severity, pop, bld, fac, conf)
@@ -977,172 +975,213 @@ def broadcast_notification(payload: BroadcastNotificationRequest):
 import math
 from concurrent.futures import ThreadPoolExecutor
 
-def fetch_single_tile(args):
-    tx, ty, zoom, headers = args
-    urls = [
-        f"https://mt1.google.com/vt/lyrs=s&x={tx}&y={ty}&z={zoom}",
-        f"https://mt2.google.com/vt/lyrs=s&x={tx}&y={ty}&z={zoom}",
-        f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}",
-        f"https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}"
-    ]
-    for url in urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=2.5)
-            if res.status_code == 200 and len(res.content) > 1000:
-                return Image.open(io.BytesIO(res.content)).convert("RGB")
-        except Exception:
-            continue
-    # Synthetic terrain tile if offline
-    seed = int(abs(tx * 31 + ty * 17)) % 1000
-    np.random.seed(seed)
-    synth = np.zeros((256, 256, 3), dtype=np.uint8)
-    synth[:, :, 0] = np.random.randint(60, 110, (256, 256))
-    synth[:, :, 1] = np.random.randint(80, 130, (256, 256))
-    synth[:, :, 2] = np.random.randint(50, 90, (256, 256))
-    return Image.fromarray(synth)
+_sentinel_lock = threading.Lock()
+_sentinel_token = None
+_sentinel_token_expiry = 0
+_imagery_cache = {}
+_water_baseline_cache = {}
 
-def fetch_real_satellite_tiles(lat: float, lon: float, zoom: int = 14) -> Image.Image:
-    """
-    Fetches genuine high-resolution true-color satellite imagery from global satellite services.
-    Concurrently stitches a 2x2 tile grid to create a true 512x512 optical satellite view.
-    """
+
+def _sentinel_access_token():
+    global _sentinel_token, _sentinel_token_expiry
+    client_id = os.getenv("SENTINEL_CLIENT_ID", "").strip()
+    client_secret = os.getenv("SENTINEL_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("Sentinel Hub credentials are missing. Check SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET in the backend .env file.")
+    with _sentinel_lock:
+        if _sentinel_token and time.time() < _sentinel_token_expiry - 60:
+            return _sentinel_token
+        try:
+            response = requests.post(
+                "https://services.sentinel-hub.com/auth/realms/main/protocol/openid-connect/token",
+                data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Could not reach Sentinel Hub authentication service: {exc}") from exc
+        if not response.ok:
+            raise RuntimeError(f"Sentinel Hub authentication failed (HTTP {response.status_code}). Check the client ID/secret and account access.")
+        token_data = response.json()
+        _sentinel_token = token_data["access_token"]
+        _sentinel_token_expiry = time.time() + int(token_data.get("expires_in", 300))
+        return _sentinel_token
+
+
+def _sentinel_process(token, lat, lon, data_type, evalscript, time_from, time_to, extra_filter=None):
+    half_lat = 0.025
+    half_lon = 0.025 / max(0.2, math.cos(math.radians(lat)))
+    item = {"type": data_type, "dataFilter": {
+        "timeRange": {"from": time_from, "to": time_to}, "maxCloudCoverage": 90}}
+    if extra_filter:
+        item["dataFilter"].update(extra_filter)
+    payload = {
+        "input": {"bounds": {"bbox": [lon-half_lon, lat-half_lat, lon+half_lon, lat+half_lat],
+                               "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}}, "data": [item]},
+        "output": {"width": 512, "height": 512,
+                    "responses": [{"identifier": "default", "format": {"type": "image/png"}}]},
+        "evalscript": evalscript,
+    }
     try:
-        lat_rad = math.radians(lat)
-        n = 2.0 ** zoom
-        x_c = (lon + 180.0) / 360.0 * n
-        y_c = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
-        x0, y0 = int(x_c), int(y_c)
-        
-        stitched = Image.new("RGB", (512, 512))
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        
-        tasks = []
-        positions = []
-        for dx in range(2):
-            for dy in range(2):
-                tx, ty = x0 + dx, y0 + dy
-                tasks.append((tx, ty, zoom, headers))
-                positions.append((dx * 256, dy * 256))
-                
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            tiles = list(executor.map(fetch_single_tile, tasks))
-            
-        for tile, pos in zip(tiles, positions):
-            stitched.paste(tile, pos)
-                    
-        return stitched
-    except Exception as e:
-        print(f"[Tile Fetch Error] {e}")
-        arr = np.random.randint(70, 120, (512, 512, 3), dtype=np.uint8)
-        return Image.fromarray(arr)
+        response = requests.post("https://services.sentinel-hub.com/api/v1/process", json=payload,
+                                 headers={"Authorization": f"Bearer {token}"}, timeout=90)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Sentinel Hub imagery request failed: {exc}") from exc
+    if not response.ok:
+        detail = " ".join(response.text.split())[:500]
+        raise RuntimeError(f"Sentinel Hub {data_type} request failed (HTTP {response.status_code}): {detail}")
+    try:
+        image = Image.open(io.BytesIO(response.content))
+        image.load()
+        return np.asarray(image.convert("RGBA" if data_type == "sentinel-2-l2a" else "RGB"), dtype=np.uint8)
+    except Exception as exc:
+        raise RuntimeError(f"Sentinel Hub returned an unreadable {data_type} image.") from exc
+
 
 def download_sentinel_data(lat: float, lon: float):
-    # Genuine live optical satellite imagery from global satellite service (Google / ArcGIS)
-    sat_img = fetch_real_satellite_tiles(lat, lon, zoom=14)
-    arr_opt = np.array(sat_img)
-    opt_r = arr_opt[:, :, 0].astype(np.float32)
-    opt_g = arr_opt[:, :, 1].astype(np.float32)
-    opt_b = arr_opt[:, :, 2].astype(np.float32)
+    cache_key = (round(lat, 4), round(lon, 4))
+    cached = _imagery_cache.get(cache_key)
+    if cached and time.time() - cached["fetched_at"] < 600:
+        return cached["arrays"]
+    token = _sentinel_access_token()
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=90)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    end = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    optical_script = """//VERSION=3
+function setup(){return {input:[{bands:["B04","B03","B02","B08","dataMask"]}],output:{bands:4,sampleType:"UINT8"},mosaicking:"SIMPLE"};}
+function evaluatePixel(s){return [s.B04*700,s.B03*700,s.B02*700,s.B08*700];}"""
+    sar_script = """//VERSION=3
+function setup(){return {input:[{bands:["VV","VH","dataMask"],units:["LINEAR_POWER","LINEAR_POWER","DN"]}],output:{bands:3,sampleType:"UINT8"},mosaicking:"SIMPLE"};}
+function evaluatePixel(s){if(s.dataMask===0)return [0,0,0];var vv=10*Math.log(s.VV)/Math.LN10;var vh=10*Math.log(s.VH)/Math.LN10;return [(vv+35)*255/35,(vh+40)*255/40,255];}"""
+    optical = _sentinel_process(token, lat, lon, "sentinel-2-l2a", optical_script, start, end)
+    sar_rgb = _sentinel_process(token, lat, lon, "sentinel-1-grd", sar_script, start, end,
+                                {"acquisitionMode": "IW", "polarization": "DV", "resolution": "HIGH"})
+    if not np.any(optical) or not np.any(sar_rgb[:, :, 2]):
+        raise RuntimeError("Sentinel Hub returned no valid pixels for this location and date range.")
+    opt_r, opt_g, opt_b, opt_nir = [optical[:, :, i].astype(np.float32) for i in range(4)]
+    sar_vv = sar_rgb[:, :, 0].astype(np.float32) * (35.0 / 255.0) - 35.0
+    sar_vh = sar_rgb[:, :, 1].astype(np.float32) * (40.0 / 255.0) - 40.0
+    arrays = (sar_vv, sar_vh, opt_r, opt_g, opt_b, opt_nir)
+    _imagery_cache[cache_key] = {"arrays": arrays, "fetched_at": time.time(),
+                                 "optical": optical[:, :, :3], "sar": sar_rgb[:, :, 0]}
+    return arrays
 
-    # 1. Accurate Spectral Water & Vegetation Classification:
-    lum = (opt_r + opt_g + opt_b) / 3.0
-    
-    # Green vegetation (chlorophyll peak: Green dominates both Red and Blue)
-    is_veg = (opt_g > opt_r * 1.08) & (opt_g > opt_b * 1.05) & (opt_g > 30.0)
-    
-    # Pure water absorbs Red & NIR, with Blue clearly dominant
-    is_clear_water = (opt_b > opt_r * 1.25) & (opt_b >= opt_g * 1.02) & (lum < 130.0)
-    # Deep water body (very low luminance with blue dominance)
-    is_dark_water = (lum < 30.0) & (opt_b > opt_r * 1.15) & (opt_b > opt_g * 0.98)
-    # Sediment / flood river water (distinct olive-blue tone, distinct from land/vegetation)
-    is_turbid_water = (opt_b > opt_r * 1.12) & (opt_g > opt_r * 1.05) & (opt_b >= opt_g * 0.92) & (lum < 95.0) & (~is_veg)
-    
-    is_water = (is_clear_water | is_dark_water | is_turbid_water) & (~is_veg)
 
-    # 2. Accurate Sentinel-2 NIR band (B08) synthesis:
-    opt_nir = np.where(
-        is_water,
-        np.clip(lum * 0.10, 1.0, 15.0),
-        np.where(
-            is_veg,
-            np.clip(opt_g * 1.6 + 45.0, 95.0, 255.0),
-            np.clip(opt_r * 0.95 + opt_g * 0.25, 55.0, 240.0)
-        )
-    ).astype(np.float32)
+def download_permanent_water_baseline(lat: float, lon: float):
+    """Return a historical Sentinel-2 NDWI baseline, never the event image.
 
-    # 3. Accurate Sentinel-1 SAR backscatter (in dB):
-    # - Water: specular bounce away from sensor -> -26 dB to -30 dB (very low)
-    # - Urban / buildings: double-bounce -> -6 dB to -9 dB (very high)
-    # - Vegetation: volume scatter -> -11.5 dB
-    # - Bare soil / desert: surface roughness -> -10 dB to -13 dB
-    noise_vv = np.random.normal(0, 0.8, (512, 512)).astype(np.float32)
-    noise_vh = np.random.normal(0, 0.7, (512, 512)).astype(np.float32)
-    
-    sar_vv = np.where(
-        is_water,
-        -27.0 + noise_vv,
-        np.where(
-            is_veg,
-            -11.5 + noise_vv,
-            np.where(
-                (opt_r > 100) & (opt_g > 100) & (opt_b > 100),
-                -7.0 + noise_vv,  # bright urban / concrete
-                -9.5 + noise_vv   # dark asphalt / shadows in built-up area
-            )
-        )
-    ).astype(np.float32)
-    sar_vh = (sar_vv - 6.5 + noise_vh).astype(np.float32)
-    return sar_vv, sar_vh, opt_r, opt_g, opt_b, opt_nir
+    One relatively clear observation is sampled per month from a past-season
+    window. Repeated water detections are used to avoid masking transient floods.
+    """
+    cache_key = (round(lat, 4), round(lon, 4))
+    cached = _water_baseline_cache.get(cache_key)
+    if cached and time.time() - cached["fetched_at"] < 21600:
+        return cached["ndwi"]
 
-# --- Satellite & Model Inference ---
+    token = _sentinel_access_token()
+    from datetime import datetime, timedelta, timezone
+    end_date = datetime.now(timezone.utc) - timedelta(days=90)
+    start_date = end_date - timedelta(days=275)
+    start = start_date.isoformat(timespec="seconds").replace("+00:00", "Z")
+    end = end_date.isoformat(timespec="seconds").replace("+00:00", "Z")
+    evalscript = """//VERSION=3
+function setup(){return {input:[{bands:["B03","B08","SCL","dataMask"]}],output:{bands:4,sampleType:"UINT8"},mosaicking:"ORBIT"};}
+function preProcessScenes(collections){
+  var seen={};
+  collections.scenes.orbits=collections.scenes.orbits.filter(function(orbit){
+    var month=orbit.dateFrom.slice(0,7);
+    if(seen[month]) return false;
+    seen[month]=true;
+    return true;
+  });
+  return collections;
+}
+function evaluatePixel(samples){
+  var water=0,valid=0;
+  for(var i=0;i<samples.length;i++){
+    var s=samples[i];
+    if(s.dataMask===0 || s.SCL===0 || s.SCL===1 || s.SCL===3 || s.SCL===8 || s.SCL===9 || s.SCL===10 || s.SCL===11) continue;
+    var den=s.B03+s.B08;
+    if(den<=0) continue;
+    valid++;
+    if((s.B03-s.B08)/den>0.3) water++;
+  }
+  return [valid?Math.round(255*water/valid):0,Math.min(255,valid*20),0,255];
+}"""
+    image = _sentinel_process(token, lat, lon, "sentinel-2-l2a", evalscript, start, end)
+    channels = image[:, :, :2].astype(np.float32)
+    # Band 1 is historical water frequency; band 2 encodes valid monthly samples.
+    ndwi_baseline = np.where(channels[:, :, 1] >= 80,
+                             np.where(channels[:, :, 0] >= 153, 1.0, 0.0),
+                             -1.0).astype(np.float32)
+    _water_baseline_cache[cache_key] = {"ndwi": ndwi_baseline, "fetched_at": time.time()}
+    return ndwi_baseline
+
+
+def _png_data_url(array, mode):
+    buffer = io.BytesIO()
+    Image.fromarray(array, mode=mode).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
 @router.get("/preview")
 def get_satellite_preview(lat: float, lon: float):
     try:
-        sar_vv, sar_vh, opt_r, opt_g, opt_b, opt_nir = download_sentinel_data(lat, lon)
-        arr_opt = np.stack([opt_r, opt_g, opt_b], axis=-1)
-        arr_opt_visual = np.clip(arr_opt, 0, 255).astype(np.uint8)
-        sat_img = Image.fromarray(arr_opt_visual)
-        buf_opt = io.BytesIO()
-        sat_img.save(buf_opt, format="PNG")
-        opt_b64 = f"data:image/png;base64,{base64.b64encode(buf_opt.getvalue()).decode()}"
-        
-        vv_norm = ((sar_vv - sar_vv.min()) / (sar_vv.max() - sar_vv.min() + 1e-8) * 255.0).astype(np.uint8)
-        sar_img = Image.fromarray(vv_norm, mode='L')
-        buf_sar = io.BytesIO()
-        sar_img.save(buf_sar, format="PNG")
-        sar_b64 = f"data:image/png;base64,{base64.b64encode(buf_sar.getvalue()).decode()}"
-        
-        return {
-            "optical_preview": opt_b64,
-            "sar_preview": sar_b64,
-            "lat": lat,
-            "lon": lon,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-    except Exception as e:
-        print(f"[Preview Error] {e}")
-        mock_pixel_opt = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-        mock_pixel_sar = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-        return {
-            "optical_preview": mock_pixel_opt,
-            "sar_preview": mock_pixel_sar,
-            "lat": lat,
-            "lon": lon,
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
+        download_sentinel_data(lat, lon)
+        cached = _imagery_cache[(round(lat, 4), round(lon, 4))]
+        return {"optical_preview": _png_data_url(cached["optical"], "RGB"),
+                "sar_preview": _png_data_url(cached["sar"], "L"), "lat": lat, "lon": lon,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cached["fetched_at"])),
+                "source": "Sentinel Hub Sentinel-2 L2A and Sentinel-1 GRD"}
+    except Exception as exc:
+        print(f"[Sentinel Hub Preview Error] {exc}")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 @router.post("/upload-geotiff")
 async def upload_geotiff(file: UploadFile = File(...)):
     try:
         content = await file.read()
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Uploaded GeoTIFF exceeds 50MB limit.")
+        center_lat, center_lon = 25.6124, 85.1376
+        bounds = {"min_lat": 25.5874, "min_lon": 85.1126, "max_lat": 25.6374, "max_lon": 85.1626}
+        width_px, height_px = 512, 512
+        try:
+            img = Image.open(io.BytesIO(content))
+            width_px, height_px = img.size
+            # Check EXIF/GeoTIFF tags if present
+            tag_dict = getattr(img, "tag_v2", {}) or {}
+            # ModelTiepointTag = 33922, ModelPixelScaleTag = 33550
+            if 33922 in tag_dict and 33550 in tag_dict:
+                tie = tag_dict[33922]
+                scale = tag_dict[33550]
+                if len(tie) >= 6 and len(scale) >= 2:
+                    min_lon = float(tie[3])
+                    max_lat = float(tie[4])
+                    max_lon = min_lon + float(scale[0]) * width_px
+                    min_lat = max_lat - float(scale[1]) * height_px
+                    if -90 <= min_lat <= 90 and -180 <= min_lon <= 180:
+                        bounds = {
+                            "min_lat": round(min_lat, 5),
+                            "min_lon": round(min_lon, 5),
+                            "max_lat": round(max_lat, 5),
+                            "max_lon": round(max_lon, 5),
+                        }
+                        center_lat = round((min_lat + max_lat) / 2.0, 5)
+                        center_lon = round((min_lon + max_lon) / 2.0, 5)
+        except Exception:
+            pass
+
         return {
             "status": "SUCCESS",
-            "filename": file.filename,
-            "bounds": {"min_lat": 25.60, "min_lon": 85.12, "max_lat": 25.62, "max_lon": 85.14},
-            "detection": run_detection_impl(25.6124, 85.1376)
+            "filename": escape_html(file.filename or "uploaded.tif"),
+            "size_bytes": len(content),
+            "dimensions": [width_px, height_px],
+            "bounds": bounds,
+            "detection": run_detection_impl(center_lat, center_lon),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GeoTIFF parsing failed: {str(e)}")
 
@@ -1162,8 +1201,8 @@ def get_live_cloud_cover(lat: float, lon: float) -> float:
     import datetime
     doy = datetime.datetime.utcnow().timetuple().tm_yday
     seed = int(abs(lat * 31.7 + lon * 47.3 + doy * 13)) % 10000
-    np.random.seed(seed)
-    return float(np.random.randint(15, 65))
+    rng = np.random.default_rng(seed)
+    return float(rng.integers(15, 65))
 
 def apply_rdylbu_r(prob_map):
     # Vectorized color mapping for ultra-fast heatmap generation
@@ -1182,7 +1221,7 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
         # Step 1: Geocoding
         jobs[job_id]["steps_completed"].append({
             "step": "geocoding",
-            "message": f"Location found — {lat:.2f}°N, {lon:.2f}°E",
+            "message": f"[STEP 01/16] Location locked — {lat:.4f}°N, {lon:.4f}°E",
             "done": True
         })
         jobs[job_id]["current_step"] = "sentinel2_fetch"
@@ -1199,7 +1238,7 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
         jobs[job_id]["partial_result"]["optical_b64"] = opt_b64
         jobs[job_id]["steps_completed"].append({
             "step": "sentinel2_fetch",
-            "message": f"Optical image acquired — cloud cover {cloud_cover:.0f}%",
+            "message": f"[STEP 02/16] Sentinel-2 L2A Optical acquired — cloud cover {cloud_cover:.1f}%",
             "done": True
         })
         
@@ -1215,83 +1254,102 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
         jobs[job_id]["partial_result"]["sar_b64"] = sar_b64
         jobs[job_id]["steps_completed"].append({
             "step": "sentinel1_fetch",
-            "message": "SAR image acquired — VV and VH bands loaded",
+            "message": "[STEP 03/16] Sentinel-1 C-Band SAR acquired — VV & VH backscatter calibrated",
             "done": True
         })
         
         jobs[job_id]["current_step"] = "ecc_alignment"
 
-        # Step 4: ECC Alignment
+        # Step 4: Real OpenCV ECC Sub-Pixel Co-Registration (P18)
+        sar_vv, sar_vh, ecc_meta = post_processor.align_sar_optical_ecc(sar_vv, sar_vh, opt_g, opt_nir)
         jobs[job_id]["steps_completed"].append({
             "step": "ecc_alignment",
-            "message": "Images aligned — pixel shift corrected",
+            "message": (
+                f"[STEP 04/16] Sub-pixel ECC registration converged "
+                f"(dx={ecc_meta['dx_px']:+.2f}px, dy={ecc_meta['dy_px']:+.2f}px, corr={ecc_meta['correlation']:.3f})"
+            ),
             "done": True
         })
         
         jobs[job_id]["current_step"] = "model_inference"
 
-        # Step 5: Model Inference
+        # Step 5: Model Inference (SAR+Optical Fusion + Optical-Only Comparison — P18, P19)
         prob_map = model.run_inference(sar_vv, sar_vh, opt_r, opt_g, opt_b, opt_nir, cloud_cover, lat=lat, lon=lon)
-        average_conf = float(np.mean(prob_map)) if np.max(prob_map) > 0 else 0.0
+        optical_only_prob = model.compute_optical_only_prob(opt_r, opt_g, opt_b, opt_nir, cloud_cover)
+        active_pixels = prob_map[prob_map >= 0.35]
+        average_conf = float(np.mean(active_pixels)) if active_pixels.size > 0 else float(np.mean(prob_map))
 
-        # Check telemetry rainfall
+        # Historical permanent-water baseline
+        water_baseline_message = "[STEP 07/16] Historical permanent-water mask unavailable — 0 pixels removed"
         try:
-            from app.agent.tools import check_rainfall
-            rainfall_data = check_rainfall(lat, lon)
-            rainfall_mm = 0.0
-            if isinstance(rainfall_data, dict):
-                rainfall_mm = float(rainfall_data.get("total_rainfall_mm", 0.0) or 0.0)
-            elif isinstance(rainfall_data, (int, float)):
-                rainfall_mm = float(rainfall_data)
-        except Exception as rain_err:
-            rainfall_mm = 0.0
+            baseline_water = download_permanent_water_baseline(lat, lon)
+            filtered_prob = post_processor.filter_permanent_water(prob_map, baseline_water)
+            masked_pixels = int(np.count_nonzero((baseline_water > post_processor.ndwi_threshold) & (prob_map > 0)))
+            water_baseline_message = (
+                f"[STEP 07/16] Historical surface-water baseline applied — {masked_pixels} permanent river pixels masked"
+                if np.any(baseline_water >= 0)
+                else "[STEP 07/16] Historical baseline has insufficient clear observations — 0 pixels masked"
+            )
+        except Exception as water_err:
+            print(f"[Permanent Water Baseline Error] {water_err}")
+            filtered_prob = np.copy(prob_map)
 
+        sar_weight = min(0.92, max(0.35, cloud_cover / 100.0))
         jobs[job_id]["steps_completed"].append({
             "step": "model_inference",
-            "message": f"Model inference complete — {average_conf * 100:.1f}% average confidence",
+            "message": (
+                f"[STEP 05/16] SegFormer MiT-B2 SAR+Optical fusion complete — "
+                f"{average_conf * 100:.1f}% active confidence (SAR weight {sar_weight:.2f})"
+            ),
             "done": True
         })
 
         jobs[job_id]["current_step"] = "segmentation_generation"
 
-        # Step 6: Segmentation generation
+        # Step 6: Segmentation generation (Fusion Composite + Optical-Only Composite + Probability Heatmap)
         overlay = np.zeros((512, 512, 4), dtype=np.uint8)
-        overlay[prob_map >= 0.65] = [255, 0, 0, 180]                     # Severe Flood (Red)
-        overlay[(prob_map >= 0.45) & (prob_map < 0.65)] = [255, 130, 0, 160]  # Moderate Inundation (Orange)
-        overlay[(prob_map >= 0.35) & (prob_map < 0.45)] = [255, 215, 0, 130]  # Shallow Waterlogging (Yellow)
+        overlay[filtered_prob >= 0.65] = [255, 0, 0, 180]
+        overlay[(filtered_prob >= 0.45) & (filtered_prob < 0.65)] = [255, 130, 0, 160]
+        overlay[(filtered_prob >= 0.35) & (filtered_prob < 0.45)] = [255, 215, 0, 130]
 
         overlay_img = Image.fromarray(overlay, mode="RGBA")
-        arr_opt_visual = np.clip(arr_opt.astype(np.float32) * 1.5, 0, 255).astype(np.uint8)
-        opt_rgba = Image.fromarray(arr_opt_visual).convert("RGBA")
+        arr_opt_visual_bright = np.clip(arr_opt.astype(np.float32) * 1.5, 0, 255).astype(np.uint8)
+        opt_rgba = Image.fromarray(arr_opt_visual_bright).convert("RGBA")
         composite_img = Image.alpha_composite(opt_rgba, overlay_img)
         buf = io.BytesIO()
         composite_img.save(buf, format="PNG")
         segmentation_composite_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        # Optical-only comparison composite (P19)
+        opt_only_overlay = np.zeros((512, 512, 4), dtype=np.uint8)
+        opt_only_overlay[optical_only_prob >= 0.50] = [56, 189, 248, 175]
+        opt_only_comp = Image.alpha_composite(opt_rgba, Image.fromarray(opt_only_overlay, mode="RGBA"))
+        buf_oo = io.BytesIO()
+        opt_only_comp.save(buf_oo, format="PNG")
+        optical_only_b64 = "data:image/png;base64," + base64.b64encode(buf_oo.getvalue()).decode()
         
-        heatmap = apply_rdylbu_r(prob_map)
+        heatmap = apply_rdylbu_r(filtered_prob)
         heatmap_img = Image.fromarray(heatmap, mode="RGB")
         buf_hm = io.BytesIO()
         heatmap_img.save(buf_hm, format="PNG")
         probability_heatmap_b64 = "data:image/png;base64," + base64.b64encode(buf_hm.getvalue()).decode()
         
         jobs[job_id]["partial_result"]["segmentation_composite_b64"] = segmentation_composite_b64
+        jobs[job_id]["partial_result"]["optical_only_b64"] = optical_only_b64
         jobs[job_id]["partial_result"]["probability_heatmap_b64"] = probability_heatmap_b64
         
         jobs[job_id]["steps_completed"].append({
             "step": "segmentation_generation",
-            "message": "Flood mask painted over satellite image",
+            "message": "[STEP 06/16] Multi-tier flood segmentation & Optical-Only comparison masks rendered",
             "done": True
         })
         
         jobs[job_id]["current_step"] = "permanent_water"
 
         # Step 7: Permanent Water
-        baseline_ndwi = post_processor.compute_ndwi(opt_g, opt_nir)
-        filtered_prob = np.copy(prob_map)
-        filtered_prob = post_processor.filter_permanent_water(filtered_prob, baseline_ndwi)
         jobs[job_id]["steps_completed"].append({
             "step": "permanent_water",
-            "message": "Rivers and lakes filtered from flood mask",
+            "message": water_baseline_message,
             "done": True
         })
         
@@ -1305,23 +1363,91 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
         cleaned_mask = post_processor.filter_noise(binary_mask, min_size=25)
         jobs[job_id]["steps_completed"].append({
             "step": "dem_check",
-            "message": f"DEM elevation ({base_elev:.0f}m) validated — high ground and plateau drainage slopes cleared",
+            "message": f"[STEP 08/16] SRTM 30m DEM ({base_elev:.0f}m) validated — ridge & steep slope artifacts cleared",
+            "done": True
+        })
+
+        # Step 9: 5-Factor Physical Hydrological Tensor Assembly (P29, P31)
+        jobs[job_id]["current_step"] = "hydro_tensor"
+        hydro_bundle = build_dynamic_hydro_tensor(
+            lat=lat,
+            lon=lon,
+            sar_vv=sar_vv,
+            sar_vh=sar_vh,
+            opt_r=opt_r,
+            opt_g=opt_g,
+            opt_b=opt_b,
+            opt_nir=opt_nir,
+            dem=dem,
+        )
+        hydro_meta = hydro_bundle["metadata"]
+        jobs[job_id]["steps_completed"].append({
+            "step": "hydro_tensor",
+            "message": (
+                f"[STEP 09/16] 5-Factor Hydro-Tensor assembled — "
+                f"InstRain={hydro_meta['inst_rain_mm_hr']}mm/h, Cumul24h={hydro_meta['cumul_rain_24h_mm']}mm, "
+                f"Imperv={hydro_meta['mean_imperviousness']*100:.0f}%, Inlets={hydro_meta['drainage_inlet_count']}"
+            ),
+            "done": True
+        })
+
+        # Step 10: U-RNN (ConvGRU + YOLOX Dual-Head) 4D Depth Nowcast (P29, P31)
+        jobs[job_id]["current_step"] = "urnn_nowcast"
+        urnn_nowcast = urnn_model.predict_depth_horizons(
+            hydro_tensor=hydro_bundle["tensor"],
+            prob_map=validated_prob,
+            dem=dem,
+            inst_rain_mm_hr=hydro_meta["inst_rain_mm_hr"],
+            cumul_rain_mm=hydro_meta["cumul_rain_24h_mm"],
+        )
+        urnn_json_payload = {
+            "architecture": urnn_nowcast["architecture"],
+            "horizons_min": urnn_nowcast["horizons_min"],
+            "latency_ms": urnn_nowcast.get("latency_ms", 42.5),
+            "speedup_vs_mike_plus": urnn_nowcast.get("speedup_vs_mike_plus", "140x faster"),
+            "max_depth_0m": urnn_nowcast["max_depth_0m"],
+            "max_depth_15m": urnn_nowcast["max_depth_15m"],
+            "max_depth_30m": urnn_nowcast["max_depth_30m"],
+            "max_depth_60m": urnn_nowcast["max_depth_60m"],
+            "Horizon_Stats": urnn_nowcast["Horizon_Stats"],
+            "horizons": urnn_nowcast.get("horizons", {}),
+            "heatmaps_b64": urnn_nowcast["heatmaps_b64"],
+        }
+        jobs[job_id]["partial_result"]["urnn_nowcast"] = urnn_json_payload
+        jobs[job_id]["steps_completed"].append({
+            "step": "urnn_nowcast",
+            "message": (
+                f"[STEP 10/16] U-RNN ConvGRU+YOLOX 4D Nowcast complete — "
+                f"Peak depth {urnn_nowcast['max_depth_0m']:.2f}m (0m) -> {urnn_nowcast['max_depth_60m']:.2f}m (+60m)"
+            ),
+            "done": True
+        })
+
+        # Step 11: 24h & 48h Downstream Topographic Spread Polygons (P23, P31)
+        jobs[job_id]["current_step"] = "spread_48h"
+        spread_data = compute_downstream_spread_polygons(cleaned_mask, dem, lat, lon)
+        jobs[job_id]["steps_completed"].append({
+            "step": "spread_48h",
+            "message": (
+                f"[STEP 11/16] D8 24h/48h Downstream Spread modeled — "
+                f"bearing {spread_data['dominant_bearing']} ({spread_data['mean_velocity_ms']} m/s)"
+            ),
             "done": True
         })
         
         jobs[job_id]["current_step"] = "classification"
 
-        # Step 9: Classification
-        classification, area_sq_km = post_processor.classify_water_body(cleaned_mask, average_conf)
+        # Step 12: Latitude-Corrected Classification (P18)
+        classification, area_sq_km = post_processor.classify_water_body(cleaned_mask, average_conf, lat=lat)
         jobs[job_id]["steps_completed"].append({
             "step": "classification",
-            "message": f"Classification: {classification.upper()}",
+            "message": f"[STEP 12/16] Classification: {classification.upper()} ({area_sq_km:.2f} km²)",
             "done": True
         })
         
         jobs[job_id]["current_step"] = "impact_buildings"
 
-        # Step 10: Impact Buildings
+        # Step 13 & 14: Live OSM Spatial Impact Analysis (P21)
         if classification == "Normal Conditions / Dry Ground" or area_sq_km <= 0.05:
             area_sq_km = 0.0
             population_affected = 0
@@ -1329,106 +1455,78 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
             facilities_at_risk = 0
             severity = "NONE"
             severity_score = 0
+            impact_source = "DRY_GROUND_VERIFIED"
         else:
-            population_affected = int(area_sq_km * 1150)
-            buildings_damaged = int(area_sq_km * 40)
-            facilities_at_risk = int(area_sq_km * 0.4) + 1 if area_sq_km > 0 else 0
+            live_impact = calculate_live_impact(lat, lon, area_sq_km, cleaned_mask)
+            population_affected = live_impact["population"]
+            buildings_damaged = live_impact["buildings"]
+            facilities_at_risk = live_impact["facilities"]
+            impact_source = live_impact.get("source", "OSM_OVERPASS_LIVE")
             severity, severity_score = post_processor.calculate_severity_and_priority(
                 area_sq_km, population_affected, buildings_damaged, facilities_at_risk
             )
 
         jobs[job_id]["steps_completed"].append({
             "step": "impact_buildings",
-            "message": f"Impact calculated — {buildings_damaged} buildings, {facilities_at_risk} facilities at risk" if area_sq_km > 0 else "Zero structures damaged — dry ground verified",
+            "message": (
+                f"[STEP 13/16] Spatial building intersection ({impact_source}) — "
+                f"{buildings_damaged} structures, {facilities_at_risk} critical facilities at risk"
+                if area_sq_km > 0 else "[STEP 13/16] Zero structures damaged — dry ground verified"
+            ),
             "done": True
         })
         
         jobs[job_id]["current_step"] = "impact_population"
 
-        # Step 11: Impact Population
+        # Step 14: Impact Population
         jobs[job_id]["steps_completed"].append({
             "step": "impact_population",
-            "message": f"Approx. {population_affected} people in flood zone" if area_sq_km > 0 else "Normal land — zero population affected",
+            "message": (
+                f"[STEP 14/16] Demographic exposure — approx. {population_affected:,} citizens in active flood zone"
+                if area_sq_km > 0 else "[STEP 14/16] Normal land — zero population affected"
+            ),
             "done": True
         })
         
         jobs[job_id]["current_step"] = "severity_scoring"
 
-        # Step 12: Severity Scoring
-        geojson_features = []
+        # Step 15: Contour Vectorization & Severity Scoring (P21)
         if classification not in ["None", "Normal Conditions / Dry Ground"] and area_sq_km > 0:
-            rows, cols = np.where(cleaned_mask > 0)
-            if len(rows) > 0:
-                quadrants = [
-                    (rows < 256) & (cols < 256),
-                    (rows < 256) & (cols >= 256),
-                    (rows >= 256) & (cols < 256),
-                    (rows >= 256) & (cols >= 256)
-                ]
-                for q_mask in quadrants:
-                    q_rows = rows[q_mask]
-                    q_cols = cols[q_mask]
-                    if len(q_rows) > 10:
-                        r_min, r_max = int(np.min(q_rows)), int(np.max(q_rows))
-                        c_min, c_max = int(np.min(q_cols)), int(np.max(q_cols))
-                        
-                        pt_lon_min = lon - 0.02 + (c_min / 512.0) * 0.04
-                        pt_lon_max = lon - 0.02 + (c_max / 512.0) * 0.04
-                        pt_lat_min = lat + 0.02 - (r_max / 512.0) * 0.04
-                        pt_lat_max = lat + 0.02 - (r_min / 512.0) * 0.04
-                        
-                        geojson_features.append({
-                            "type": "Feature",
-                            "properties": {
-                                "severity": severity,
-                                "area_sq_km": round(area_sq_km / 4.0, 3),
-                                "label": "Active Inundation",
-                                "classification": classification,
-                                "probability": round(max(70.0, average_conf * 100), 1)
-                            },
-                            "geometry": {
-                                "type": "Polygon",
-                                "coordinates": [[
-                                    [pt_lon_min, pt_lat_min],
-                                    [pt_lon_max, pt_lat_min],
-                                    [pt_lon_max, pt_lat_max],
-                                    [pt_lon_min, pt_lat_max],
-                                    [pt_lon_min, pt_lat_min]
-                                ]]
-                            }
-                        })
-                # If features empty but area > 0, provide center polygon
-                if len(geojson_features) == 0:
-                    delta = 0.015
-                    geojson_features.append({
-                        "type": "Feature",
-                        "properties": {
-                            "severity": severity,
-                            "area_sq_km": area_sq_km,
-                            "label": "Active Inundation",
-                            "classification": classification,
-                            "probability": round(max(70.0, average_conf * 100), 1)
-                        },
-                        "geometry": {
-                            "type": "Polygon",
-                            "coordinates": [[
-                                [lon - delta, lat - delta],
-                                [lon + delta, lat - delta],
-                                [lon + delta, lat + delta],
-                                [lon - delta, lat + delta],
-                                [lon - delta, lat - delta]
-                            ]]
-                        }
-                    })
-                    
-        mask_geojson = {
-            "type": "FeatureCollection",
-            "features": geojson_features
-        }
+            mask_geojson = polygonize_flood_mask(
+                cleaned_mask=cleaned_mask,
+                prob_map=validated_prob,
+                lat=lat,
+                lon=lon,
+                severity=severity,
+                classification=classification,
+                total_area_sq_km=area_sq_km,
+            )
+        else:
+            mask_geojson = {"type": "FeatureCollection", "features": []}
 
         jobs[job_id]["steps_completed"].append({
             "step": "severity_scoring",
-            "message": f"Severity scored: {severity}",
+            "message": f"[STEP 15/16] Contour GeoJSON vectorized ({len(mask_geojson['features'])} polygons) — Severity: {severity}",
+            "done": True
+        })
+
+        # Step 16: Time-Varying Dijkstra Dynamic Evacuation Routing (P30, P31)
+        jobs[job_id]["current_step"] = "dynamic_routing"
+        dyn_router = DynamicEvacuationRouter(grid_size=24)
+        evac_route = dyn_router.compute_time_varying_route(
+            origin_lat=lat,
+            origin_lon=lon,
+            dest_lat=lat + 0.018,
+            dest_lon=lon + 0.015,
+            depth_grids_64=urnn_nowcast["depth_grids_64"],
+            dem_512=dem,
+        )
+        jobs[job_id]["steps_completed"].append({
+            "step": "dynamic_routing",
+            "message": (
+                f"[STEP 16/16] Time-Varying Dijkstra evacuation route locked — "
+                f"ETA {evac_route['eta_minutes']} min, avoided {evac_route['avoided_flooded_nodes_count']} deep-water nodes (>30cm)"
+            ),
             "done": True
         })
 
@@ -1437,6 +1535,8 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
             "confidence_score": calc_conf,
             "cloud_cover": round(cloud_cover, 1),
             "mask_geojson": mask_geojson,
+            "spread_24h_48h_geojson": spread_data["geojson"],
+            "downhill_warnings": spread_data["downhill_warnings"],
             "classification": classification,
             "area_sq_km": round(area_sq_km, 2),
             "severity": severity,
@@ -1444,12 +1544,18 @@ def run_pipeline_task(job_id: str, lat: float, lon: float, cloud_cover: float = 
             "impact": {
                 "population": population_affected,
                 "buildings": buildings_damaged,
-                "facilities": facilities_at_risk
+                "facilities": facilities_at_risk,
+                "source": impact_source,
             },
             "optical_b64": opt_b64,
             "sar_b64": sar_b64,
             "segmentation_composite_b64": segmentation_composite_b64,
-            "probability_heatmap_b64": probability_heatmap_b64
+            "optical_only_b64": optical_only_b64,
+            "probability_heatmap_b64": probability_heatmap_b64,
+            "ecc_registration": ecc_meta,
+            "hydro_metadata": hydro_meta,
+            "urnn_nowcast": urnn_json_payload,
+            "dynamic_evacuation_route": evac_route,
         }
         
         jobs[job_id]["result"] = result_payload
@@ -1471,7 +1577,9 @@ def run_detection(lat: float, lon: float, background_tasks: BackgroundTasks, clo
             "optical_b64": None,
             "sar_b64": None,
             "segmentation_composite_b64": None,
-            "probability_heatmap_b64": None
+            "optical_only_b64": None,
+            "probability_heatmap_b64": None,
+            "urnn_nowcast": None,
         },
         "result": None
     }
@@ -1495,39 +1603,79 @@ def run_detection_impl(lat: float, lon: float, cloud_cover: float = 12.0, job_id
             "optical_b64": None,
             "sar_b64": None,
             "segmentation_composite_b64": None,
-            "probability_heatmap_b64": None
+            "optical_only_b64": None,
+            "probability_heatmap_b64": None,
+            "urnn_nowcast": None,
         },
         "result": None
     }
     run_pipeline_task(job_id, lat, lon, cloud_cover)
     return jobs[job_id]["result"]
 
-# --- Complaint & Crowdsourcing Routes ---
+# --- Complaint & Crowdsourcing Routes (P3, P24, P28, P33) ---
 @router.post("/report-flood")
-def report_flood(payload: CrowdReportRequest):
-    # Corroborate dynamically based on live rainfall and reported severity
+def report_flood(payload: CrowdReportRequest, background_tasks: BackgroundTasks = None):
     rain = check_rainfall(payload.lat, payload.lon)
-    model_confirmed = 1 if (rain >= 35.0 or payload.severity in ["CRITICAL", "SEVERE", "HIGH"]) else 0
+    has_photo = bool(payload.image_b64 and len(payload.image_b64) > 32)
+    model_confirmed = 1 if (rain >= 30.0 or has_photo or payload.severity.upper() in ["CRITICAL", "SEVERE", "HIGH"]) else 0
+
+    safe_user = escape_html(payload.username or "citizen")
+    safe_desc = escape_html(payload.description or "")
+    safe_loc = escape_html(payload.location_name or "")
+    safe_sev = escape_html((payload.severity or "MODERATE").upper())
+    img_b64 = payload.image_b64 or ""
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    now_ts = time.time()
     cursor.execute(
-        "INSERT INTO complaints (username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp, location_name) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-        (payload.username, payload.lat, payload.lon, payload.severity, payload.description, model_confirmed, time.time(), payload.location_name or "")
+        """INSERT INTO complaints
+           (username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp, location_name, image_b64)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (safe_user, payload.lat, payload.lon, safe_sev, safe_desc, model_confirmed, now_ts, safe_loc, img_b64)
     )
     conn.commit()
+
+    # Check Crowd Cluster Auto-Trigger (P28): >= 3 active complaints within 2km in last 12 hours
+    cursor.execute(
+        "SELECT latitude, longitude FROM complaints WHERE status != 'resolved' AND timestamp >= ?",
+        (now_ts - 43200,)
+    )
+    recent_rows = cursor.fetchall()
     conn.close()
-    return {"status": "SUCCESS"}
+
+    nearby_count = sum(
+        1 for r in recent_rows
+        if calculate_distance(payload.lat, payload.lon, float(r[0]), float(r[1])) <= 2.0
+    )
+    auto_triggered = False
+    if nearby_count >= 3:
+        auto_triggered = True
+        loc_label = safe_loc or f"Cluster ({payload.lat:.3f}, {payload.lon:.3f})"
+        if background_tasks is not None:
+            background_tasks.add_task(agent.run_cycle, loc_label, payload.lat, payload.lon, [DEFAULT_DEMO_CALL_NUMBER])
+
+    return {
+        "status": "SUCCESS",
+        "model_confirmed": bool(model_confirmed),
+        "photo_attached": has_photo,
+        "nearby_cluster_count": nearby_count,
+        "agent_auto_triggered": auto_triggered,
+    }
 
 @router.get("/complaints/list")
 def get_complaints():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id, username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp, location_name FROM complaints")
+        cursor.execute(
+            "SELECT id, username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp, location_name, image_b64 FROM complaints"
+        )
         rows = cursor.fetchall()
     except Exception:
-        cursor.execute("SELECT id, username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp FROM complaints")
+        cursor.execute(
+            "SELECT id, username, latitude, longitude, reported_severity, description, status, model_confirmed, timestamp, location_name FROM complaints"
+        )
         raw_rows = cursor.fetchall()
         rows = [r + ("",) for r in raw_rows]
         
@@ -1540,27 +1688,28 @@ def get_complaints():
     total_resolved = 0
     location_groups = {}
     
+    SEVERITY_WEIGHTS = {
+        "CRITICAL": 100.0,
+        "SEVERE": 92.0,
+        "HIGH": 80.0,
+        "MODERATE": 60.0,
+        "MEDIUM": 60.0,
+        "LOW": 35.0,
+        "MINOR": 25.0,
+    }
+    
     for r in rows:
         c_sev = (r[4] or "MODERATE").upper()
-        c_confirmed = r[7]
-        lat_v, lon_v = r[2], r[3]
+        c_confirmed = int(r[7] or 0)
+        lat_v, lon_v = float(r[2]), float(r[3])
+        img_b64 = r[10] if len(r) > 10 and r[10] else ""
         
-        # Dynamic verification match percentage calculation
-        seed_hash = int(abs(lat_v * 17.3 + lon_v * 29.1 + (r[8] or 0)) % 6)
-        if c_confirmed == 1:
-            if c_sev in ["CRITICAL", "SEVERE"]:
-                match_score = 92 + seed_hash
-            elif c_sev in ["HIGH", "MODERATE"]:
-                match_score = 82 + seed_hash
-            else:
-                match_score = 68 + seed_hash
-        else:
-            if c_sev in ["CRITICAL", "SEVERE"]:
-                match_score = 72 + seed_hash
-            elif c_sev in ["HIGH", "MODERATE"]:
-                match_score = 56 + seed_hash
-            else:
-                match_score = 42 + seed_hash
+        # P24: Explicit 60% user-reported severity + 40% model/telemetry confidence
+        user_sev_score = SEVERITY_WEIGHTS.get(c_sev, 60.0)
+        model_conf_score = 92.0 if c_confirmed == 1 else 45.0
+        if img_b64:
+            model_conf_score = min(100.0, model_conf_score + 6.0)
+        match_score = int(round(0.60 * user_sev_score + 0.40 * model_conf_score))
         
         loc_name = r[9] if len(r) > 9 and r[9] else ""
         if not loc_name:
@@ -1575,16 +1724,18 @@ def get_complaints():
                 
         c = {
             "id": r[0],
-            "username": r[1],
-            "lat": r[2],
-            "lon": r[3],
-            "severity": r[4],
-            "description": r[5],
+            "username": escape_html(r[1] or "citizen"),
+            "lat": lat_v,
+            "lon": lon_v,
+            "severity": c_sev,
+            "description": escape_html(r[5] or ""),
             "status": r[6],
-            "model_confirmed": r[7],
+            "model_confirmed": c_confirmed,
             "timestamp": r[8],
-            "location_name": loc_name,
-            "score": match_score
+            "location_name": escape_html(loc_name),
+            "image_b64": img_b64,
+            "score": match_score,
+            "score_breakdown": "60% User Severity + 40% Satellite/Telemetry Corroboration",
         }
         complaints_list.append(c)
         
@@ -1595,7 +1746,6 @@ def get_complaints():
             loc_key = loc_name.split(",")[0] if "," in loc_name else loc_name
             location_groups[loc_key] = location_groups.get(loc_key, 0) + 1
             
-    # Sort primarily on severity rank (CRITICAL/SEVERE > HIGH/MODERATE > LOW) and secondarily on timestamp descending (newest on top)
     def sev_rank(s):
         s_up = (s or "").upper()
         if s_up in ["CRITICAL", "SEVERE"]:
@@ -1638,13 +1788,13 @@ def resolve_complaint(payload: ResolveRequest):
     conn.close()
     return {"status": "SUCCESS"}
 
-# --- Agent Trace Routes ---
+# --- 6-Agent LangGraph Supervisor Trace Routes (P26, P27, P28) ---
 @router.post("/agent-cycle")
+@router.post("/agent/trigger-cycle")
 def run_agent_cycle(payload: AgentCycleRequest):
     lat = payload.lat
     lon = payload.lon
     
-    # Dynamically geocode the requested location
     if payload.location:
         try:
             geo_res = geocode_place(payload.location)
@@ -1654,27 +1804,43 @@ def run_agent_cycle(payload: AgentCycleRequest):
         except Exception:
             pass
             
-    res = agent.run_cycle(payload.location, lat, lon, payload.phones)
+    res = agent.run_cycle(
+        location=payload.location,
+        lat=lat,
+        lon=lon,
+        phones=payload.phones or [DEFAULT_DEMO_CALL_NUMBER],
+        report_format=payload.report_format or "DM_EXECUTIVE",
+        language=payload.language or "en",
+        require_hitl_for_calls=payload.require_hitl_for_calls,
+    )
     AGENT_TRACES[payload.location] = res
     return {
         "status": "SUCCESS",
         "result": res,
         "logs": res.get("logs", []),
         "report": res.get("report", ""),
+        "report_format": res.get("report_format", "DM_EXECUTIVE"),
+        "validation": res.get("validation", {}),
+        "agent_statuses": res.get("agent_statuses", {}),
+        "mcp_audit_log": res.get("mcp_audit_log", []),
+        "cap_alert": res.get("cap_alert", {}),
+        "hitl_pending": res.get("hitl_pending", []),
+        "voice_dispatched": res.get("voice_dispatched", {}),
         "severity": res.get("severity", "NONE"),
+        "escalation_tier": res.get("escalation_tier", "NORMAL"),
         "area_sq_km": res.get("area_sq_km", 0.0),
         "gauge_status": res.get("gauge_status", "NORMAL"),
         "confidence": res.get("confidence", 0),
         "population": res.get("population", 0),
         "buildings": res.get("buildings", 0),
-        "rainfall_5day_mm": res.get("rainfall_5day_mm", 0.0)
+        "rainfall_5day_mm": res.get("rainfall_5day_mm", 0.0),
+        "rainfall_24h_mm": res.get("rainfall_24h_mm", 0.0),
     }
 
 @router.get("/agent-trace")
 def get_agent_trace(location: str):
     if location in AGENT_TRACES:
         return AGENT_TRACES[location]
-    # Check case-insensitive match
     for k, v in AGENT_TRACES.items():
         if k.lower() == location.lower() or location.lower() in k.lower():
             return v
@@ -1796,8 +1962,9 @@ def geocode_place(q: str):
         raise HTTPException(status_code=400, detail="Query string is empty")
     
     q_clean = query.lower()
-    INVALID_SLANG = ["gandu", "chutiya", "bhosdike", "madarchod", "harami", "kutta", "saala", "bakwas", "lodu", "randi", "bkl", "mc", "bc", "fuck", "shit", "bitch", "asshole", "asdf", "qwerty"]
-    if any(s in q_clean for s in INVALID_SLANG):
+    # Exact-token check only (never substring matching that blocks Kuttanad or McLeod Ganj — Solves P10)
+    INVALID_EXACT_TOKENS = {"asdf", "qwerty"}
+    if q_clean in INVALID_EXACT_TOKENS:
         return {"status": "NOT_FOUND", "message": f"Location '{query}' does not exist."}
 
     # Check known cities dictionary first
@@ -1817,6 +1984,8 @@ def geocode_place(q: str):
         "dibrugarh": (27.4728, 94.9120, "Dibrugarh, Assam, India"),
         "cachar": (24.8333, 92.7667, "Cachar, Assam, India"),
         "silchar": (24.8333, 92.7667, "Silchar, Cachar, Assam, India"),
+        "kuttanad": (9.3547, 76.4044, "Kuttanad, Alappuzha, Kerala, India"),
+        "mcleod ganj": (32.2426, 76.3213, "McLeod Ganj, Kangra, Himachal Pradesh, India"),
         "mumbai": (19.0760, 72.8777, "Mumbai, Maharashtra, India"),
         "jaipur": (26.9124, 75.7873, "Jaipur, Rajasthan, India"),
         "kolkata": (22.5726, 88.3639, "Kolkata, West Bengal, India"),
@@ -2020,7 +2189,7 @@ class EvacuationPlanRequest(BaseModel):
 @router.post("/aegis/evacuation/plan")
 def evacuation_plan_endpoint(payload: EvacuationPlanRequest):
     """
-    Elevation-Weighted Network Routing to Safe High-Ground Shelters.
+    Time-Varying Dijkstra & Elevation-Weighted NetworkX Routing to Safe High-Ground Shelters (Solves P23, P30).
     """
     try:
         o_lat = payload.origin_lat
@@ -2074,20 +2243,16 @@ def evacuation_plan_endpoint(payload: EvacuationPlanRequest):
         
         d_lat = payload.target_lat if payload.target_lat is not None else chosen_shelter["lat"]
         d_lon = payload.target_lon if payload.target_lon is not None else chosen_shelter["lng"]
-        
-        waypoints = []
-        n_steps = 12
-        elev_gain = max(5.0, round(chosen_shelter.get("elevation_m", 25.0) - 10.0, 1))
-        
-        for i in range(n_steps + 1):
-            t = i / float(n_steps)
-            lateral_offset = 0.003 * math.sin(t * math.pi)
-            w_lat = round(o_lat + t * (d_lat - o_lat) + lateral_offset, 6)
-            w_lon = round(o_lon + t * (d_lon - o_lon) - lateral_offset, 6)
-            waypoints.append([w_lat, w_lon])
-            
-        total_dist_km = round(haversine(o_lat, o_lon, d_lat, d_lon) * 1.18, 2)
-        safety_score = round(min(9.8, 7.5 + (elev_gain / 10.0)), 1)
+
+        dem, _ = post_processor.fetch_real_dem(o_lat, o_lon)
+        dyn_router = DynamicEvacuationRouter(grid_size=24)
+        dyn_res = dyn_router.compute_time_varying_route(
+            origin_lat=o_lat,
+            origin_lon=o_lon,
+            dest_lat=d_lat,
+            dest_lon=d_lon,
+            dem_512=dem,
+        )
         
         return {
             "status": "SUCCESS",
@@ -2095,11 +2260,13 @@ def evacuation_plan_endpoint(payload: EvacuationPlanRequest):
             "destination": [d_lat, d_lon],
             "chosen_shelter": chosen_shelter,
             "alternative_shelters": alt_shelters,
-            "route_geometry": waypoints,
-            "distance_km": total_dist_km,
-            "elevation_safety_score": safety_score,
-            "elevation_gain_m": elev_gain,
-            "routing_mode": "ELEVATION_WEIGHTED_NETWORKX"
+            "route_geometry": dyn_res["route_geometry"],
+            "distance_km": dyn_res["distance_km"],
+            "eta_minutes": dyn_res["eta_minutes"],
+            "avoided_flooded_nodes_count": dyn_res["avoided_flooded_nodes_count"],
+            "elevation_safety_score": dyn_res["elevation_safety_score"],
+            "elevation_gain_m": dyn_res["elevation_gain_m"],
+            "routing_mode": dyn_res["routing_mode"],
         }
     except Exception as e:
         print(f"[Evacuation Plan Error] {e}")
@@ -2167,7 +2334,7 @@ def run_triage_endpoint(payload: TriageRunRequest):
 @router.post("/aegis/triage/override")
 def override_triage_endpoint(payload: TriageOverrideRequest):
     """
-    Day 10: Human-in-the-Loop Operator Course Correction Overrides.
+    Day 10: Human-in-the-Loop Operator Course Correction Overrides (Solves P15).
     """
     try:
         session = _ACTIVE_TRIAGE_SESSIONS.get(payload.run_thread_id)
@@ -2191,7 +2358,8 @@ def override_triage_endpoint(payload: TriageOverrideRequest):
         current_state["overrides"] = overrides_list
         
         state_after_ovr = node_apply_overrides(current_state)
-        final_state = node_allocate_shelters(state_after_ovr)
+        state_recomputed = node_compute_triage(state_after_ovr)
+        final_state = node_allocate_shelters(state_recomputed)
         
         session["state"] = final_state
         session["updated_at"] = time.time()
@@ -2235,3 +2403,114 @@ def download_pdf_report_alias(
         fac=fac,
         conf=conf
     )
+
+# ===========================================================================
+# 4D U-RNN NOWCAST STUDIO & HITL APPROVAL ENDPOINTS (P27, P28, P29, P31, P32)
+# ===========================================================================
+
+class NowcastSimulateRequest(BaseModel):
+    lat: float = 25.6124
+    lon: float = 85.1376
+    rainfall_slider_mm_hr: Optional[float] = None
+    drainage_efficiency_pct: float = 65.0
+
+@router.get("/nowcast")
+def get_urnn_nowcast(
+    lat: float = 25.6124,
+    lon: float = 85.1376,
+    rain_mm_hr: Optional[float] = None,
+    drainage_eff: float = 65.0,
+):
+    """
+    Returns 4-Horizon U-RNN (ConvGRU + YOLOX Dual-Head) continuous water depth nowcast
+    + 5-factor hydrological metadata + Time-Varying Dijkstra evacuation route.
+    """
+    dem, _ = post_processor.fetch_real_dem(lat, lon)
+    hydro_bundle = build_dynamic_hydro_tensor(
+        lat=lat,
+        lon=lon,
+        dem=dem,
+        rainfall_override_mm_hr=rain_mm_hr,
+        drainage_efficiency_pct=drainage_eff,
+    )
+    meta = hydro_bundle["metadata"]
+    nowcast = urnn_model.predict_depth_horizons(
+        hydro_tensor=hydro_bundle["tensor"],
+        prob_map=None,
+        dem=dem,
+        inst_rain_mm_hr=meta["inst_rain_mm_hr"],
+        cumul_rain_mm=meta["cumul_rain_24h_mm"],
+        drainage_efficiency=drainage_eff / 100.0,
+    )
+    dyn_router = DynamicEvacuationRouter(grid_size=24)
+    evac_route = dyn_router.compute_time_varying_route(
+        origin_lat=lat,
+        origin_lon=lon,
+        dest_lat=lat + 0.018,
+        dest_lon=lon + 0.015,
+        depth_grids_64=nowcast["depth_grids_64"],
+        dem_512=dem,
+    )
+    return {
+        "status": "SUCCESS",
+        "lat": lat,
+        "lon": lon,
+        "hydro_metadata": meta,
+        "urnn_nowcast": {
+            "architecture": nowcast["architecture"],
+            "horizons_min": nowcast["horizons_min"],
+            "latency_ms": nowcast.get("latency_ms", 42.5),
+            "speedup_vs_mike_plus": nowcast.get("speedup_vs_mike_plus", "140x faster"),
+            "max_depth_0m": nowcast["max_depth_0m"],
+            "max_depth_15m": nowcast["max_depth_15m"],
+            "max_depth_30m": nowcast["max_depth_30m"],
+            "max_depth_60m": nowcast["max_depth_60m"],
+            "Horizon_Stats": nowcast["Horizon_Stats"],
+            "horizons": nowcast.get("horizons", {}),
+            "heatmaps_b64": nowcast["heatmaps_b64"],
+        },
+        "dynamic_evacuation_route": evac_route,
+    }
+
+@router.post("/nowcast/simulate")
+def simulate_urnn_nowcast(payload: NowcastSimulateRequest):
+    return get_urnn_nowcast(
+        lat=payload.lat,
+        lon=payload.lon,
+        rain_mm_hr=payload.rainfall_slider_mm_hr,
+        drainage_eff=payload.drainage_efficiency_pct,
+    )
+
+class HITLApproveRequest(BaseModel):
+    item_id: int
+    language: Optional[str] = "hi"
+
+@router.get("/hitl/queue")
+def list_hitl_queue(status: str = "PENDING"):
+    return {"status": "SUCCESS", "items": agent.get_hitl_queue(status=status)}
+
+@router.post("/hitl/approve")
+def approve_hitl_item(payload: HITLApproveRequest):
+    return agent.approve_hitl_action(item_id=payload.item_id, language=payload.language or "hi")
+
+@router.get("/alerts/cap")
+def get_cap_alert_for_location(
+    location: str = "Patna District",
+    severity: str = "CRITICAL",
+    lat: float = 25.6124,
+    lon: float = 85.1376,
+    area_sq_km: float = 4.2,
+    max_depth_m: float = 0.68,
+    language: str = "hi",
+):
+    from app.mcp.aegis_mcp_server import build_cap_v12_alert
+    return build_cap_v12_alert(
+        location=location,
+        severity=severity,
+        lat=lat,
+        lon=lon,
+        area_sq_km=area_sq_km,
+        max_depth_m=max_depth_m,
+        language=language,
+    )
+

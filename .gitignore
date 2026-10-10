@@ -48,6 +48,8 @@ MANIFEST
 # ==========================================
 node_modules/
 **/node_modules/
+.npm-cache/
+**/.npm-cache/
 .expo/
 **/.expo/
 npm-debug.log*
@@ -106,3 +108,6 @@ Thumbs.db
 **/.claude/
 *.swp
 *.swo
+
+*.log
+**/*.log

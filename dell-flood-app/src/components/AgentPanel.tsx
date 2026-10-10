@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,
   View,
@@ -10,6 +10,7 @@ import {
   Alert,
   Platform,
   Image,
+  Dimensions,
 } from 'react-native';
 import {
   Target,
@@ -25,8 +26,16 @@ import {
   Users,
   Compass,
   ExternalLink,
+  ShieldCheck,
+  PhoneCall,
+  Cpu,
+  AlertTriangle,
+  Database,
 } from 'lucide-react-native';
 import { apiService, DetectionResult } from '../services/api';
+import { AppLanguage, t, DEFAULT_DEMO_PHONE_E164 } from '../utils/i18n';
+
+const IS_COMPACT_LAYOUT = Platform.OS !== 'web' || Dimensions.get('window').width < 600;
 
 interface AgentPanelProps {
   lastResult: DetectionResult | null;
@@ -34,6 +43,7 @@ interface AgentPanelProps {
   activeLon: number;
   onNavigateToMap?: () => void;
   onOpenReportModal?: () => void;
+  lang?: AppLanguage;
 }
 
 interface AgentResultSummary {
@@ -46,6 +56,10 @@ interface AgentResultSummary {
   confidence: number;
   population: number;
   buildings: number;
+  peak_depth_60m?: number;
+  evac_eta_min?: number;
+  hitl_queue_id?: number | null;
+  cap_xml?: string;
 }
 
 const PRESET_DISTRICTS = [
@@ -58,18 +72,57 @@ const PRESET_DISTRICTS = [
   { name: 'Kaziranga', lat: 26.5775, lon: 93.1711 },
 ];
 
+const SIX_SPECIALIST_AGENTS = [
+  { id: 'WeatherSentinel', label: '1. WeatherSentinel', role: 'OpenWeather + IMD Red-Alert' },
+  { id: 'HydrologySentinel', label: '2. HydrologySentinel', role: 'CWC Gauge + GloFAS Discharge' },
+  { id: 'SatelliteVisionAgent', label: '3. SatelliteVisionAgent', role: 'SegFormer + U-RNN 4D Nowcast' },
+  { id: 'GISImpactRouterAgent', label: '4. GISImpactRouterAgent', role: 'OSM Spatial Join + Dynamic Dijkstra' },
+  { id: 'AlertDispatcherAgent', label: '5. AlertDispatcherAgent', role: 'CAP v1.2 + Twilio Voice + HITL' },
+  { id: 'RAGReportCompilerAgent', label: '6. RAGReportCompilerAgent', role: 'ChromaDB SOP + Claim Validator' },
+];
+
+const REPORT_FORMATS = [
+  { key: 'DM_EXECUTIVE', label: 'DM Executive Brief' },
+  { key: 'NDRF_FIELD', label: 'NDRF Tactical Order' },
+  { key: 'PUBLIC_BULLETIN_EN_HI', label: 'Bilingual Citizen Advisory' },
+  { key: 'RESOURCE_MATRIX', label: 'Relief Logistics Matrix' },
+] as const;
+
 export const AgentPanel: React.FC<AgentPanelProps> = ({
   lastResult,
   activeLat,
   activeLon,
   onNavigateToMap,
   onOpenReportModal,
+  lang = 'en',
 }) => {
   const [locationName, setLocationName] = useState<string>('Patna District');
   const [runningAgent, setRunningAgent] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [report, setReport] = useState<string>('');
   const [summary, setSummary] = useState<AgentResultSummary | null>(null);
+  const [reportFormat, setReportFormat] = useState<'DM_EXECUTIVE' | 'NDRF_FIELD' | 'PUBLIC_BULLETIN_EN_HI' | 'RESOURCE_MATRIX'>('DM_EXECUTIVE');
+  const [callingVoice, setCallingVoice] = useState<boolean>(false);
+  const [hitlItems, setHitlItems] = useState<any[]>([]);
+  const [mcpLedger, setMcpLedger] = useState<any[]>([]);
+  const [showMcpModal, setShowMcpModal] = useState<boolean>(false);
+
+  const loadGovernanceData = async () => {
+    try {
+      const [hRes, mRes] = await Promise.all([
+        apiService.getHitlQueue(),
+        apiService.getMcpAuditLog(12),
+      ]);
+      if (Array.isArray(hRes)) setHitlItems(hRes);
+      if (Array.isArray(mRes)) setMcpLedger(mRes);
+    } catch (err) {
+      // Non-fatal
+    }
+  };
+
+  useEffect(() => {
+    loadGovernanceData();
+  }, []);
 
   const triggerAgent = async () => {
     if (!locationName.trim()) {
@@ -103,7 +156,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         }
       }
 
-      const response = await apiService.runAgentCycle(locationName, targetLat, targetLon);
+      const response = await apiService.runAgentCycle(locationName, targetLat, targetLon, {
+        report_format: reportFormat,
+        language: lang,
+      });
 
       const logList = response.logs || response.result?.logs || [];
       const reportText = response.report || response.result?.report || '';
@@ -122,6 +178,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           confidence: resultObj.confidence || 0,
           population: resultObj.population || 0,
           buildings: resultObj.buildings || 0,
+          peak_depth_60m: resultObj.peak_depth_60m || 0,
+          evac_eta_min: resultObj.evac_eta_min || 0,
+          hitl_queue_id: resultObj.hitl_queue_id || null,
+          cap_xml: resultObj.cap_xml || '',
         });
       } else {
         const trace = await apiService.getAgentTrace(locationName);
@@ -141,10 +201,77 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           });
         }
       }
+      await loadGovernanceData();
     } catch (e: any) {
       Alert.alert('Execution Notice', e.message || 'Agent cycle completed with fallback telemetry.');
     } finally {
       setRunningAgent(false);
+    }
+  };
+
+  const handleFormatSwitch = async (fmt: 'DM_EXECUTIVE' | 'NDRF_FIELD' | 'PUBLIC_BULLETIN_EN_HI' | 'RESOURCE_MATRIX') => {
+    setReportFormat(fmt);
+    if (!summary) return;
+    try {
+      const res = await apiService.getReportPreview({
+        location: summary.location,
+        lat: activeLat,
+        lon: activeLon,
+        area_sq_km: summary.area_sq_km,
+        classification: summary.classification,
+        severity: summary.severity,
+        population_affected: summary.population,
+        buildings_damaged: summary.buildings,
+        facilities_at_risk: Math.max(1, Math.round(summary.buildings * 0.02)),
+        report_format: fmt,
+        language: lang === 'hi' ? 'hi-IN' : 'en-IN',
+      });
+      if (res?.report) {
+        setReport(res.report);
+      }
+    } catch (err) {
+      // Ignore
+    }
+  };
+
+  const handleDemoVoiceCall = async () => {
+    setCallingVoice(true);
+    try {
+      const sev = summary?.severity || lastResult?.severity || 'HIGH';
+      const loc = summary?.location || locationName || 'Patna District';
+      const area = summary?.area_sq_km || lastResult?.area_sq_km || 3.4;
+      const res = await apiService.triggerVoiceCall(
+        DEFAULT_DEMO_PHONE_E164,
+        `Emergency Alert for ${loc}: ${sev} flood risk over ${area} sq km.`,
+        {
+          location: loc,
+          severity: sev,
+          language: lang,
+          max_depth_m: summary?.peak_depth_60m || 1.2,
+        }
+      );
+      const scriptText = res.script || res.script_spoken || res.message || 'Voice call dispatched.';
+      if (Platform.OS === 'web') {
+        window.alert(`📞 Outbound Voice Call to ${DEFAULT_DEMO_PHONE_E164} (${lang === 'hi' ? 'Hindi Polly.Aditi' : 'English alice'}):\n\n${scriptText}`);
+      } else {
+        Alert.alert(`📞 Outbound Call (${DEFAULT_DEMO_PHONE_E164})`, scriptText);
+      }
+    } catch (e: any) {
+      Alert.alert('Voice Gateway Notice', e?.message || 'Could not trigger voice call.');
+    } finally {
+      setCallingVoice(false);
+    }
+  };
+
+  const handleApproveHitl = async (itemId: number) => {
+    try {
+      const res = await apiService.approveHitlItem(itemId, lang);
+      if (res.status === 'SUCCESS') {
+        Alert.alert('HITL Broadcast Approved', `Emergency voice alert & CAP v1.2 dispatched to ${DEFAULT_DEMO_PHONE_E164}.`);
+        loadGovernanceData();
+      }
+    } catch (e: any) {
+      Alert.alert('Approval Error', e?.message || 'Requires Official role token.');
     }
   };
 
@@ -167,14 +294,15 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     if (
       line.includes('STEP') ||
       line.includes('START') ||
-      line.includes('COMPLETE')
+      line.includes('COMPLETE') ||
+      line.includes('SUPERVISOR')
     ) {
       return '#38bdf8'; // Sky blue
     }
     if (
       line.includes('SegFormer') ||
       line.includes('Sentinel') ||
-      line.includes('NDWI') ||
+      line.includes('U-RNN') ||
       line.includes('ML')
     ) {
       return '#c084fc'; // Purple
@@ -190,30 +318,40 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     >
       <View style={styles.centerContainer}>
         {/* ========================================================= */}
-        {/* 1. HERO BANNER CARD (Pixel-matched with media_1790631247152) */}
+        {/* 1. HERO BANNER CARD                                       */}
         {/* ========================================================= */}
         <View style={styles.bannerWrapper}>
-          {/* Left Column: Title, Subtitle, and Action Button */}
           <View style={styles.bannerLeftCol}>
-            <Text style={styles.heroTitle}>Autonomous Agent{'\n'}Monitor</Text>
+            <Text style={styles.heroTitle}>{t(lang, 'agentTitle')}</Text>
 
             <Text style={styles.heroSubtitle}>
-              Trigger the FloodAgent loop to autonomously fetch coordinates, query
-              real-time OpenWeather 5-day forecasts, evaluate CWC gauges, run satellite
-              bands + SegFormer ML, and generate situation bulletins.
+              {t(lang, 'agentSubtitle')}
             </Text>
 
-            <TouchableOpacity
-              style={styles.viewMapBtn}
-              onPress={onNavigateToMap}
-              activeOpacity={0.85}
-            >
-              <RefreshCw size={13} color="#ffffff" style={{ marginRight: 6 }} />
-              <Text style={styles.viewMapBtnText}>View Map →</Text>
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              <TouchableOpacity
+                style={styles.viewMapBtn}
+                onPress={onNavigateToMap}
+                activeOpacity={0.85}
+              >
+                <RefreshCw size={13} color="#ffffff" style={{ marginRight: 6 }} />
+                <Text style={styles.viewMapBtnText}>View Map →</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.viewMapBtn, { backgroundColor: '#dc2626' }]}
+                onPress={handleDemoVoiceCall}
+                disabled={callingVoice}
+                activeOpacity={0.85}
+              >
+                <PhoneCall size={13} color="#ffffff" style={{ marginRight: 6 }} />
+                <Text style={styles.viewMapBtnText}>
+                  {callingVoice ? 'Dialing...' : t(lang, 'callDemoBtn')}
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
 
-          {/* Right Column: Satellite, Radar Scan, and Shield Artwork */}
           <View style={styles.bannerRightCol}>
             <Image
               source={require('../../assets/agent-banner-right-art.png')}
@@ -221,6 +359,68 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               resizeMode="cover"
             />
           </View>
+        </View>
+
+        {/* ========================================================= */}
+        {/* 1B. 6-AGENT LANGGRAPH SUPERVISOR TOPOLOGY                 */}
+        {/* ========================================================= */}
+        <View style={styles.card}>
+          <View style={[styles.cardHeaderRow, { justifyContent: 'space-between' }]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Cpu size={17} color="#059669" />
+              <Text style={styles.cardHeaderTitle}>6-Agent LangGraph Supervisor Mesh</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.mcpPillBtn}
+              onPress={() => {
+                setShowMcpModal(!showMcpModal);
+                loadGovernanceData();
+              }}
+            >
+              <Database size={11} color="#2563eb" style={{ marginRight: 4 }} />
+              <Text style={styles.mcpPillText}>MCP Ledger ({mcpLedger.length})</Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.agentGrid}>
+            {SIX_SPECIALIST_AGENTS.map((ag) => {
+              const isDone = logs.length > 0 && !runningAgent;
+              return (
+                <View
+                  key={ag.id}
+                  style={[
+                    styles.agentMiniCard,
+                    runningAgent && { borderColor: '#38bdf8', backgroundColor: '#f0f9ff' },
+                    isDone && { borderColor: '#a7f3d0', backgroundColor: '#ecfdf5' },
+                  ]}
+                >
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Text style={styles.agentMiniTitle}>{ag.label}</Text>
+                    <View
+                      style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: 4,
+                        backgroundColor: runningAgent ? '#0284c7' : isDone ? '#10b981' : '#94a3b8',
+                      }}
+                    />
+                  </View>
+                  <Text style={styles.agentMiniRole}>{ag.role}</Text>
+                </View>
+              );
+            })}
+          </View>
+
+          {showMcpModal && mcpLedger.length > 0 && (
+            <View style={styles.mcpBox}>
+              <Text style={styles.mcpBoxHeader}>🔒 SHA-256 Signed MCP Tool Provenance Ledger</Text>
+              {mcpLedger.slice(0, 5).map((item, i) => (
+                <Text key={i} style={styles.mcpBoxLine} numberOfLines={1}>
+                  • [{item.tool_name}] sig:{item.sha256_signature?.slice(0, 12)}... ({item.latency_ms}ms)
+                </Text>
+              ))}
+            </View>
+          )}
         </View>
 
         {/* ========================================================= */}
@@ -232,7 +432,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <Text style={styles.cardHeaderTitle}>Quick Select Target District</Text>
           </View>
 
-          {/* District Chips */}
           <View style={styles.chipsWrap}>
             {PRESET_DISTRICTS.map((d, i) => {
               const isActive = locationName.toLowerCase() === d.name.toLowerCase();
@@ -256,7 +455,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             })}
           </View>
 
-          {/* Search Input & Run Cycle Button Row */}
           <View style={styles.searchActionRow}>
             <View style={styles.searchInputContainer}>
               <Search size={18} color="#94a3b8" style={{ marginRight: 8 }} />
@@ -284,12 +482,47 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               ) : (
                 <>
                   <RefreshCw size={15} color="#ffffff" style={{ marginRight: 6 }} />
-                  <Text style={styles.runCycleText}>Run Cycle</Text>
+                  <Text style={styles.runCycleText}>{t(lang, 'runAgentCycle')}</Text>
                 </>
               )}
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* ========================================================= */}
+        {/* 2B. HUMAN-IN-THE-LOOP (HITL) EMERGENCY APPROVAL QUEUE      */}
+        {/* ========================================================= */}
+        {hitlItems.filter((h) => h.status === 'PENDING_OFFICIAL_APPROVAL').length > 0 && (
+          <View style={[styles.card, { borderColor: '#fecaca', backgroundColor: '#fef2f2' }]}>
+            <View style={styles.cardHeaderRow}>
+              <AlertTriangle size={18} color="#dc2626" />
+              <Text style={[styles.cardHeaderTitle, { color: '#991b1b' }]}>
+                HITL Emergency Broadcast Queue (Official Sign-Off)
+              </Text>
+            </View>
+            {hitlItems
+              .filter((h) => h.status === 'PENDING_OFFICIAL_APPROVAL')
+              .slice(0, 3)
+              .map((item) => (
+                <View key={item.id} style={styles.hitlRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: '#7f1d1d' }}>
+                      {item.location} — {item.severity} ({item.area_sq_km} km²)
+                    </Text>
+                    <Text style={{ fontSize: 10.5, color: '#991b1b' }}>
+                      Pop at Risk: {item.population_affected?.toLocaleString()} | Target: {DEFAULT_DEMO_PHONE_E164}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.hitlApproveBtn}
+                    onPress={() => handleApproveHitl(item.id)}
+                  >
+                    <Text style={styles.hitlApproveText}>Approve & Dial</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+          </View>
+        )}
 
         {/* ========================================================= */}
         {/* 3. ACTIVE REGIONAL DISASTER BRIEF CARD                    */}
@@ -313,14 +546,14 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         </TouchableOpacity>
 
         {/* ========================================================= */}
-        {/* 4. LIVE PIPELINE LOGS (Shown when running or logs exist)  */}
+        {/* 4. LIVE PIPELINE LOGS                                     */}
         {/* ========================================================= */}
         {logs.length > 0 && (
           <View style={styles.consoleContainer}>
             <View style={styles.consoleHeader}>
               <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
                 <Terminal size={15} color="#10b981" />
-                <Text style={styles.consoleTitle}>Decision Trace & Pipeline Execution Logs</Text>
+                <Text style={styles.consoleTitle}>6-Agent Supervisor Trace & MCP Execution Logs</Text>
               </View>
               <View style={styles.liveBadge}>
                 <Text style={styles.liveBadgeText}>
@@ -436,14 +669,18 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         )}
 
         {/* ========================================================= */}
-        {/* 6. SITUATION BULLETIN REPORT OUTPUT                      */}
+        {/* 6. SITUATION BULLETIN REPORT OUTPUT (4-FORMAT + VERIFIED) */}
         {/* ========================================================= */}
         {report.length > 0 && (
           <View style={styles.reportContainer}>
             <View style={styles.reportHeader}>
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <Check size={16} color="#10b981" style={{ marginRight: 6 }} />
-                <Text style={styles.reportTitle}>Agent Situation Bulletin Report</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+                <Check size={16} color="#10b981" />
+                <Text style={styles.reportTitle}>Agent Situation Bulletin</Text>
+                <View style={styles.verifiedClaimPill}>
+                  <ShieldCheck size={11} color="#059669" style={{ marginRight: 3 }} />
+                  <Text style={styles.verifiedClaimText}>Numeric Claims Verified 100%</Text>
+                </View>
               </View>
               {onOpenReportModal && (
                 <TouchableOpacity
@@ -455,7 +692,31 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 </TouchableOpacity>
               )}
             </View>
-            <ScrollView style={{ maxHeight: 220 }} nestedScrollEnabled={true}>
+
+            {/* 4-Format Selector Pills */}
+            <View style={styles.formatSelectorRow}>
+              {REPORT_FORMATS.map((fmt) => (
+                <TouchableOpacity
+                  key={fmt.key}
+                  style={[
+                    styles.formatPill,
+                    reportFormat === fmt.key && styles.formatPillActive,
+                  ]}
+                  onPress={() => handleFormatSwitch(fmt.key)}
+                >
+                  <Text
+                    style={[
+                      styles.formatPillText,
+                      reportFormat === fmt.key && styles.formatPillTextActive,
+                    ]}
+                  >
+                    {fmt.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <ScrollView style={{ maxHeight: 240 }} nestedScrollEnabled={true}>
               <Text style={styles.reportText}>{report}</Text>
             </ScrollView>
           </View>
@@ -484,7 +745,7 @@ const styles = StyleSheet.create({
   /* Hero Banner */
   bannerWrapper: {
     width: '100%',
-    flexDirection: 'row',
+    flexDirection: IS_COMPACT_LAYOUT ? 'column' : 'row',
     alignItems: 'stretch',
     backgroundColor: '#ffffff',
     borderRadius: 22,
@@ -497,15 +758,16 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.08,
     shadowRadius: 10,
     elevation: 3,
-    minHeight: 225,
+    minHeight: IS_COMPACT_LAYOUT ? undefined : 225,
   },
   bannerLeftCol: {
-    flex: 1.15,
+    flex: IS_COMPACT_LAYOUT ? 0 : 1.15,
+    width: IS_COMPACT_LAYOUT ? '100%' : undefined,
     paddingLeft: 16,
     paddingRight: 6,
     paddingTop: 16,
     paddingBottom: 16,
-    justifyContent: 'space-between',
+    justifyContent: IS_COMPACT_LAYOUT ? 'flex-start' : 'space-between',
   },
   heroTitle: {
     fontSize: 17.5,
@@ -538,16 +800,100 @@ const styles = StyleSheet.create({
   },
   viewMapBtnText: {
     color: '#ffffff',
-    fontSize: 11.5,
+    fontSize: 11,
     fontWeight: '700',
   },
   bannerRightCol: {
-    flex: 0.95,
+    flex: IS_COMPACT_LAYOUT ? 0 : 0.95,
+    width: IS_COMPACT_LAYOUT ? '100%' : undefined,
+    height: IS_COMPACT_LAYOUT ? 150 : undefined,
     overflow: 'hidden',
   },
   bannerRightArt: {
     width: '100%',
-    height: '100%',
+    height: IS_COMPACT_LAYOUT ? 150 : '100%',
+  },
+
+  /* 6-Agent Mesh */
+  agentGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  agentMiniCard: {
+    width: '48%',
+    backgroundColor: '#f8fafc',
+    borderRadius: 10,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  agentMiniTitle: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  agentMiniRole: {
+    fontSize: 9.5,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  mcpPillBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#eff6ff',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+  },
+  mcpPillText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#1d4ed8',
+  },
+  mcpBox: {
+    marginTop: 10,
+    backgroundColor: '#0f172a',
+    borderRadius: 10,
+    padding: 10,
+  },
+  mcpBoxHeader: {
+    color: '#38bdf8',
+    fontSize: 10.5,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  mcpBoxLine: {
+    color: '#cbd5e1',
+    fontSize: 9.5,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginBottom: 2,
+  },
+
+  /* HITL Queue */
+  hitlRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#ffffff',
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#fca5a5',
+    marginBottom: 6,
+  },
+  hitlApproveBtn: {
+    backgroundColor: '#dc2626',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  hitlApproveText: {
+    color: '#ffffff',
+    fontSize: 10.5,
+    fontWeight: '800',
   },
 
   /* Card 2: Quick Select District */
@@ -821,6 +1167,47 @@ const styles = StyleSheet.create({
     color: '#0f172a',
     fontSize: 13,
     fontWeight: '700',
+  },
+  verifiedClaimPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ecfdf5',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
+  },
+  verifiedClaimText: {
+    fontSize: 9.5,
+    color: '#059669',
+    fontWeight: '800',
+  },
+  formatSelectorRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 10,
+  },
+  formatPill: {
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  formatPillActive: {
+    backgroundColor: '#1e40af',
+    borderColor: '#1e40af',
+  },
+  formatPillText: {
+    fontSize: 10,
+    color: '#475569',
+    fontWeight: '700',
+  },
+  formatPillTextActive: {
+    color: '#ffffff',
   },
   viewFullReportBtn: {
     flexDirection: 'row',

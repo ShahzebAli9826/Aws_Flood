@@ -18,15 +18,26 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from api.cache import get as cache_get, set as cache_set, make_batch_cache_key, polygon_hash
-from api.client import MireyeClient, MireyeAPIError, DISASTER_PRESETS
-from api.models import (
-    FloodPolygon,
-    FloodDossier,
-    PointDossier,
-    FieldValue,
-    DossierSummary,
-)
+try:
+    from app.aegis.api.cache import get as cache_get, set as cache_set, make_batch_cache_key, polygon_hash
+    from app.aegis.api.client import MireyeClient, MireyeAPIError, DISASTER_PRESETS
+    from app.aegis.api.models import (
+        FloodPolygon,
+        FloodDossier,
+        PointDossier,
+        FieldValue,
+        DossierSummary,
+    )
+except ImportError:
+    from api.cache import get as cache_get, set as cache_set, make_batch_cache_key, polygon_hash
+    from api.client import MireyeClient, MireyeAPIError, DISASTER_PRESETS
+    from api.models import (
+        FloodPolygon,
+        FloodDossier,
+        PointDossier,
+        FieldValue,
+        DossierSummary,
+    )
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 BATCH_SIZE = 25  # Mireye batch endpoint max
