@@ -199,6 +199,8 @@ export default function App() {
       }
     } catch (e) {}
 
+    apiService.init();
+
     registerForPushNotificationsAsync().then(token => {
       if (token) setPushToken(token);
     });
@@ -1360,7 +1362,12 @@ export default function App() {
                   <View style={{ paddingVertical: 18, alignItems: 'center' }}>
                     <ActivityIndicator size="small" color="#059669" />
                   </View>
-                ) : complaints.filter(c => c.username === currentUser).length === 0 ? (
+                ) : complaints.filter(c => {
+                    const normUser = (currentUser || '').trim().toLowerCase();
+                    const cUser = (c.username || '').trim().toLowerCase();
+                    if (!normUser) return true;
+                    return cUser === normUser || cUser === 'citizen_reporter' || cUser === 'citizen';
+                  }).length === 0 ? (
                   <View style={dashStyles.emptyCardState}>
                     <FileText size={22} color="#94a3b8" />
                     <Text style={dashStyles.emptyStateTitle}>{t(appLanguage, 'noReportsTitle')}</Text>
@@ -1369,7 +1376,12 @@ export default function App() {
                     </Text>
                   </View>
                 ) : (
-                  complaints.filter(c => c.username === currentUser).map((c, index) => (
+                  complaints.filter(c => {
+                    const normUser = (currentUser || '').trim().toLowerCase();
+                    const cUser = (c.username || '').trim().toLowerCase();
+                    if (!normUser) return true;
+                    return cUser === normUser || cUser === 'citizen_reporter' || cUser === 'citizen';
+                  }).map((c, index) => (
                     <View key={index} style={dashStyles.modernLogRow}>
                       <View style={dashStyles.modernLogLeft}>
                         <View style={dashStyles.modernLogLocBadge}>

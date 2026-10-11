@@ -179,8 +179,25 @@ class URNNHydroNowcaster:
     @staticmethod
     def _render_depth_png_b64(depth_grid: np.ndarray) -> str:
         norm = np.clip(depth_grid / 1.5, 0.0, 1.0)
-        cmap = cm.get_cmap("turbo")
-        rgba = (cmap(norm) * 255).astype(np.uint8)
+        try:
+            import matplotlib
+            if hasattr(matplotlib, "colormaps"):
+                cmap = matplotlib.colormaps["turbo"]
+            else:
+                cmap = getattr(cm, "get_cmap", lambda x: None)("turbo")
+        except Exception:
+            cmap = None
+
+        if cmap is not None:
+            rgba = (cmap(norm) * 255).astype(np.uint8)
+        else:
+            # High-performance fallback: blue-cyan-orange-red ramp
+            r = (norm * 255).astype(np.uint8)
+            g = (np.sin(norm * np.pi) * 200).astype(np.uint8)
+            b = ((1.0 - norm) * 255).astype(np.uint8)
+            a = np.full_like(r, 215)
+            rgba = np.stack([r, g, b, a], axis=-1)
+
         rgba[depth_grid < 0.05, 3] = 0
         rgba[depth_grid >= 0.05, 3] = 215
         img = Image.fromarray(rgba, mode="RGBA").resize((512, 512), Image.Resampling.BILINEAR)

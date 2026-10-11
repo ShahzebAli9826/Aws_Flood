@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import hashlib
+import numpy as np
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field

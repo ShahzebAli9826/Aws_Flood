@@ -154,6 +154,8 @@ def trigger_voice_call(
     max_depth_m: float = 0.68,
     shelter_name: str = "High-Ground NDRF Relief Camp",
     custom_message: str = None,
+    message: str = None,
+    **kwargs,
 ) -> dict:
     """
     Triggers an outbound emergency voice call strictly defaulting to +917678656930 (7678656930)
@@ -162,7 +164,7 @@ def trigger_voice_call(
     target_phone = normalize_and_validate_phone(phone_number, default_demo="+917678656930")
     lang_code = "hi" if str(language).lower().startswith("hi") else "en"
 
-    speech_text = custom_message or generate_multilingual_voice_script(
+    speech_text = message or custom_message or generate_multilingual_voice_script(
         location=location,
         severity=severity,
         language=lang_code,
@@ -175,28 +177,75 @@ def trigger_voice_call(
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     from_phone = os.getenv("TWILIO_PHONE_NUMBER")
 
-    if HAS_TWILIO and account_sid and auth_token and from_phone:
-        try:
-            client = TwilioClient(account_sid, auth_token)
-            call = client.calls.create(
-                twiml=twiml_xml,
-                to=target_phone,
-                from_=from_phone,
-            )
-            print(f"[Twilio IVR] Dispatched {lang_code.upper()} call to {target_phone}. SID: {call.sid}")
-            return {
-                "status": "SUCCESS",
-                "mode": "twilio_live",
-                "call_sid": call.sid,
-                "target": target_phone,
-                "language": "hi-IN" if lang_code == "hi" else "en-IN",
-                "voice": "Polly.Aditi" if lang_code == "hi" else "alice",
-                "speech": speech_text,
-            }
-        except Exception as e:
-            print(f"[Twilio IVR] Live call failed ({e}); returning simulated dispatch receipt.")
+    if account_sid and auth_token and from_phone:
+        # 1. Attempt official Twilio SDK if available
+        if HAS_TWILIO and TwilioClient is not None:
+            try:
+                client = TwilioClient(account_sid, auth_token)
+                call = client.calls.create(
+                    twiml=twiml_xml,
+                    to=target_phone,
+                    from_=from_phone,
+                )
+                try:
+                    print(f"[Twilio IVR] Dispatched {lang_code.upper()} call to {target_phone}. SID: {call.sid}")
+                except Exception:
+                    pass
+                return {
+                    "status": "SUCCESS",
+                    "mode": "twilio_live",
+                    "call_sid": call.sid,
+                    "target": target_phone,
+                    "language": "hi-IN" if lang_code == "hi" else "en-IN",
+                    "voice": "Polly.Aditi" if lang_code == "hi" else "alice",
+                    "speech": speech_text,
+                }
+            except Exception as e:
+                try:
+                    print(f"[Twilio IVR] Twilio SDK dispatch failed ({e}); attempting direct REST fallback.")
+                except Exception:
+                    pass
 
-    print(f"[Twilio IVR SIMULATOR] Dialed {target_phone} ({lang_code}): {speech_text}")
+        # 2. Attempt direct Twilio REST API fallback via requests
+        try:
+            call_url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json"
+            res = requests.post(
+                call_url,
+                auth=(account_sid, auth_token),
+                data={"To": target_phone, "From": from_phone, "Twiml": twiml_xml},
+                timeout=12,
+            )
+            if res.status_code in [200, 201]:
+                call_json = res.json()
+                call_sid = call_json.get("sid", "CA_LIVE")
+                try:
+                    print(f"[Twilio IVR REST] Live call created to {target_phone}. SID: {call_sid}")
+                except Exception:
+                    pass
+                return {
+                    "status": "SUCCESS",
+                    "mode": "twilio_live",
+                    "call_sid": call_sid,
+                    "target": target_phone,
+                    "language": "hi-IN" if lang_code == "hi" else "en-IN",
+                    "voice": "Polly.Aditi" if lang_code == "hi" else "alice",
+                    "speech": speech_text,
+                }
+            else:
+                try:
+                    print(f"[Twilio IVR REST] Call API returned status {res.status_code}: {res.text[:120]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                print(f"[Twilio IVR REST] Direct HTTP dispatch error: {e}")
+            except Exception:
+                pass
+
+    try:
+        print(f"[Twilio IVR SIMULATOR] Dialed {target_phone} ({lang_code})")
+    except Exception:
+        pass
     return {
         "status": "SUCCESS",
         "mode": "simulated_gateway",

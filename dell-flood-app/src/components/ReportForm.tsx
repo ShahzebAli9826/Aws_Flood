@@ -11,7 +11,7 @@ import {
   Platform,
   Image,
 } from 'react-native';
-import { AlertCircle, CheckCircle2, Navigation, Send, Check, Camera, Trash2, PhoneCall } from 'lucide-react-native';
+import { AlertCircle, CheckCircle2, Navigation, Send, Check, Camera, Trash2 } from 'lucide-react-native';
 import * as Location from 'expo-location';
 import { apiService } from '../services/api';
 import { AppLanguage, t, DEFAULT_DEMO_PHONE_E164 } from '../utils/i18n';
@@ -75,7 +75,6 @@ export const ReportForm: React.FC<ReportFormProps> = ({ username, onReported, la
   const [fetchingLocation, setFetchingLocation] = useState<boolean>(false);
   const [geocodingPlace, setGeocodingPlace] = useState<boolean>(false);
   const [submitting, setSubmitting] = useState<boolean>(false);
-  const [callingDemo, setCallingDemo] = useState<boolean>(false);
   const [success, setSuccess] = useState<boolean>(false);
 
   const handleLookupPlace = async () => {
@@ -188,29 +187,6 @@ export const ReportForm: React.FC<ReportFormProps> = ({ username, onReported, la
       setSelectedCats((prev) => prev.filter((c) => c !== cat));
     } else {
       setSelectedCats((prev) => [...prev, cat]);
-    }
-  };
-
-  const handleTriggerDemoCall = async () => {
-    setCallingDemo(true);
-    try {
-      const locLabel = placeName.trim() || 'Patna District, Bihar';
-      const res = await apiService.triggerVoiceCall(DEFAULT_DEMO_PHONE_E164, '', {
-        location: locLabel,
-        severity: severity === 'SEVERE' ? 'CRITICAL' : severity,
-        language,
-        max_depth_m: severity === 'SEVERE' ? 0.72 : 0.42,
-      });
-      const alertText =
-        language === 'hi'
-          ? `+917678656930 पर AI हिंदी वॉयस कॉल सफलतापूर्वक भेजी गई!\n\nस्क्रिप्ट:\n${res.script_spoken || res.message}`
-          : `LLM Voice Alert dispatched to +917678656930!\n\nSpoken Script:\n${res.script_spoken || res.message}`;
-      if (Platform.OS === 'web') window.alert(alertText);
-      else Alert.alert('Voice Alert Dispatched', alertText);
-    } catch (e: any) {
-      Alert.alert('Call Error', e?.message || 'Unable to trigger voice call');
-    } finally {
-      setCallingDemo(false);
     }
   };
 
@@ -509,18 +485,6 @@ export const ReportForm: React.FC<ReportFormProps> = ({ username, onReported, la
             </>
           )}
         </TouchableOpacity>
-
-        {/* P34: Direct 1-Click Multilingual LLM Voice Call to 7678656930 */}
-        <TouchableOpacity
-          style={styles.demoCallBtn}
-          onPress={handleTriggerDemoCall}
-          disabled={callingDemo}
-        >
-          <PhoneCall size={15} color="#ffffff" style={{ marginRight: 6 }} />
-          <Text style={styles.demoCallBtnText}>
-            {callingDemo ? t(language, 'calling_demo') : t(language, 'call_demo_btn')}
-          </Text>
-        </TouchableOpacity>
       </View>
     </ScrollView>
   );
@@ -690,13 +654,4 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   submitButtonText: { color: '#ffffff', fontSize: 13, fontWeight: 'bold' },
-  demoCallBtn: {
-    backgroundColor: '#dc2626',
-    borderRadius: 8,
-    height: 40,
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  demoCallBtnText: { color: '#ffffff', fontSize: 12, fontWeight: '800' },
 });

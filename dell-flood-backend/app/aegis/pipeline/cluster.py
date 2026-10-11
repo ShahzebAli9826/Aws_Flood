@@ -5,8 +5,12 @@ Using DBSCAN clustering on building coordinates or a regular grid-cell fallback.
 """
 from __future__ import annotations
 import math
-import numpy as np
-from sklearn.cluster import DBSCAN
+try:
+    from sklearn.cluster import DBSCAN
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+    DBSCAN = None
 
 try:
     from app.aegis.api.models import FloodPolygon
@@ -22,7 +26,7 @@ def cluster_buildings(
     min_samples: int = 2,
 ) -> dict[int, list[dict[str, float]]]:
     """
-    Cluster building points using DBSCAN.
+    Cluster building points using DBSCAN or grid-cell fallback.
     buildings: list of dicts with 'lat' and 'lng' (or 'lon') keys.
     eps_deg: ~0.004 degrees is ~400m-450m.
     Returns dict mapping cluster_id -> list of buildings in that cluster.
@@ -35,10 +39,24 @@ def cluster_buildings(
     if len(coords) < min_samples:
         return {0: buildings}
 
-    clustering = DBSCAN(eps=eps_deg, min_samples=min_samples).fit(coords)
-    clusters: dict[int, list[dict[str, float]]] = {}
+    labels = []
+    if HAS_SKLEARN and DBSCAN is not None:
+        try:
+            clustering = DBSCAN(eps=eps_deg, min_samples=min_samples).fit(coords)
+            labels = clustering.labels_
+        except Exception:
+            labels = []
 
-    for label, b in zip(clustering.labels_, buildings):
+    if len(labels) == 0:
+        cell_to_id = {}
+        for pt in coords:
+            cell = (round(float(pt[0]) / eps_deg), round(float(pt[1]) / eps_deg))
+            if cell not in cell_to_id:
+                cell_to_id[cell] = len(cell_to_id)
+            labels.append(cell_to_id[cell])
+
+    clusters: dict[int, list[dict[str, float]]] = {}
+    for label, b in zip(labels, buildings):
         clusters.setdefault(int(label), []).append(b)
 
     return clusters
