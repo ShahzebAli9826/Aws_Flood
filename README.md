@@ -11,13 +11,86 @@
 
 </div>
 
-**Aegis** is an autonomous disaster response platform bridging satellite Earth observation, spatiotemporal deep learning, and multi-agent coordination with real-world physical infrastructure data. Powered by dual-encoder SAR + Optical fusion, 4D ConvGRU depth nowcasting, formal Model Context Protocol (MCP) tools, and an autonomous 6-agent LangGraph pipeline, Aegis detects imminent flash flood zones, dynamically routes evacuees away from submersed corridors, and empowers incident commanders and citizens in real time.
+<b>Aegis is an autonomous disaster response platform bridging large language models, satellite Earth observation, and spatiotemporal deep learning with real-time physical world infrastructure data. Powered by Google Gemini 2.5 Flash, the MirEye Earth API, and a dual-encoder SegFormer MiT-B2 architecture, Aegis handles open-ended disaster tasks while dynamically routing location-sensitive queries to verified spatial, hydrological, and environmental hazard tools.
+
+Emergency managers, field responders, and residents often lack instant verified physical-world context during extreme weather events, forcing them to manually consult disjointed federal GIS portals. By fusing dual-encoder satellite Earth observation (SAR + Optical) with sub-meter physical intelligence, continuous Topographic Wetness Index (TWI) hydrology, 4D ConvGRU depth nowcasting, and an in-flight human-in-the-loop decision engine, Aegis identifies imminent flash flood zones, dynamically routes evacuees away from submersed corridors, and empowers incident commanders in real time.</b>
 
 ---
 
-## ⚡ Key Capabilities
+## 📋 Executive Overview
 
-- **🛰️ Multimodal Dual-Encoder Segmentation:** Fuses all-weather Sentinel-1 SAR backscatter with Sentinel-2 multispectral imagery via a custom SegFormer MiT-B2 architecture, outputting clean georeferenced inundation masks even during severe cloud cover.
+During major flood disasters, emergency response operations suffer from two fatal blind spots:
+
+1. **The "Flat Map" Blind Spot:** Standard satellite segmentation only reveals where surface water was when the satellite passed overhead. It cannot predict ground elevation, soil saturation, building heights, population counts, or which dry roads will submerge in the next 6 hours.
+2. **The "Naive Routing" Blind Spot:** Standard evacuation navigation systems route evacuees based on shortest straight-line distance, leading civilians directly into low-elevation terrain depressions and flooded road basins.
+
+Aegis bridges this gap by injecting physical telemetry from the MirEye API (USGS 3DEP DEM elevation, slope, FEMA 100/500 yr floodplains, USGS NHD hydrography, and Overture building footprints) along with 4D spatiotemporal nowcasting into every routing, triage, and emergency dispatch decision.
+
+---
+
+## 🔬 Deep Learning Architecture & Pipeline
+
+Aegis implements a custom **Dual-Encoder Multimodal SegFormer architecture** specifically optimized for high-precision flood boundary delineation in challenging weather and all-terrain scenarios, paired with a **4D Multi-Scale ConvGRU spatiotemporal nowcaster**.
+
+![AEGIS Deep Learning Architecture & Pipeline](assets/architecture_pipeline.png)
+
+### System Architecture Flow
+
+```
+ [Satellite SAR + Optical] ──► [NDWI Filter] ──► [Clean GeoJSON Inundation Mask]
+                                                        │
+                                                        ▼
+                                            [Mireye Physical API]
+                                    (DEM Elev, Slope, Floodplains, POIs)
+                                                        │
+                         ┌──────────────────────────────┴──────────────────────────────┐
+                         ▼                                                             ▼
+         [Predictive TWI Hydrology Layer]                            [DBSCAN Population Clustering]
+              Flash-Flood Pooling Basins                                      │
+                         │                                                             ▼
+                         └──────────────────────────────┬──────────────────────────────┘
+                                                        ▼
+                                    [Elevation-Weighted Road Graph]
+                                      (NetworkX / Dijkstra Routing)
+                                                        │
+                                                        ▼
+                                       [Multi Criteria Triage Engine]
+                                   Priority = Pop × (1 + Exp) / Elev_Safety
+                                                        │
+                                                        ▼
+                                   [In Flight Feedback Interceptor]
+                                (LangGraph: SHELTER_FULL / ROAD_CLOSED)
+                                                        │
+                         ┌──────────────────────────────┴──────────────────────────────┐
+                         ▼                                                             ▼
+         [Incident Commander Dashboard & SITREP]                      [Geo Targeted Citizen SMS / Twilio Voice]
+```
+
+**Core Innovation: What Aegis Solves**
+
+<img width="331" height="302" alt="image" src="https://github.com/user-attachments/assets/675f372e-c163-436f-878d-a582e7b2e31a" />   
+
+---
+
+## 📊 Empirical Validation: Does Physical Context Matter?
+
+To prove that the physical coordinate round-trip performs critical life-safety work rather than visual decoration, Aegis runs an empirical benchmark comparing a **Naive Straight-Line Strategy** against the **Context-Aware Strategy** across 33 real disaster clusters:
+
+```
+[SUMMARY RESULTS] 
+  - Total Evaluated Clusters    : 33
+  - Diverged Recommendations    : 2 clusters (6.1%)
+  - Avg Extra Distance Accepted : +1.15 km (Safety Detour)
+  - Sensitivity Projection      : 9.1% (Widened TWI Variance)
+```
+
+Context-aware routing altered the primary shelter recommendation in 6.1% of disaster clusters, accepting an average of +1.15 km of travel to steer evacuees away from high-risk, flood-compromised access corridors.
+
+---
+
+## ⚡ Core Platform Capabilities
+
+- **🛰️ Multimodal Dual-Encoder Segmentation:** Fuses all-weather Sentinel-1 SAR C-band backscatter with Sentinel-2 multispectral optical imagery via a custom SegFormer MiT-B2 architecture, outputting clean georeferenced inundation masks even through dense cloud cover.
 - **⏱️ 4D Spatiotemporal Depth Nowcasting:** Multi-scale 3-level ConvGRU network predicting flood depth progression, water flow velocity vectors, and peak inundation timestamps across upcoming 1 to 6-hour forecast horizons.
 - **🤖 Autonomous 6-Agent LangGraph Pipeline:** Orchestrates ingestion, segmentation, predictive hydrology, DBSCAN population clustering, elevation-penalized Dijkstra routing, and advisory synthesis with live audit logs and human-in-the-loop control.
 - **🔌 Formal Model Context Protocol (MCP) Server:** Exposes standardized AI tools (`fetch_radar_data`, `run_segformer_detection`, `run_nowcast_simulation`, `calculate_evacuation_routes`, `trigger_emergency_alert`) directly for LLM assistants at `/api/mcp/tools`.
@@ -27,52 +100,14 @@
 
 ---
 
-## 🏗️ System Architecture
-
-```
-                       [Sentinel-1 SAR + Sentinel-2 Optical]
-                                         │
-                                         ▼
-                      [Dual-Encoder SegFormer MiT-B2 Fusion]
-                                         │
-                                         ▼
-                   [Clean GeoJSON Inundation & Hydro Mask]
-                                         │
-                 ┌───────────────────────┴───────────────────────┐
-                 ▼                                               ▼
-    [4D Multi-Scale ConvGRU]                         [Predictive TWI Hydrology]
-    Depth & Velocity Nowcasting                      Topographic Wetness Index
-                 │                                               │
-                 └───────────────────────┬───────────────────────┘
-                                         ▼
-                           [DBSCAN Population Clustering]
-                           High-Density Risk Neighborhoods
-                                         │
-                                         ▼
-                          [Elevation-Penalized Road Graph]
-                            Dijkstra Evacuation Corridors
-                                         │
-                                         ▼
-                         [Autonomous 6-Agent LangGraph]
-                     (Ingest ➔ Seg ➔ Hydro ➔ Triage ➔ Route ➔ Alert)
-                                         │
-                 ┌───────────────────────┴───────────────────────┐
-                 ▼                                               ▼
-    [MCP Server Tools API]                         [Automated Twilio Dispatch]
-    FastAPI /api/mcp/tools                         Bilingual Voice & SMS Alerts
-                 │                                               │
-                 └───────────────────────┬───────────────────────┘
-                                         ▼
-                         [Aegis Tactical Expo Frontend]
-                           Web & Native Mobile Interface
-```
-
----
-
 ## 📁 Repository Structure
 
 ```
 Aegis/
+├── assets/                                 # Architecture diagrams, banners, and schematics
+│   ├── architecture_pipeline.png           # Deep learning SegFormer + nowcaster pipeline diagram
+│   └── dashboard-hero-banner.jpg           # Dashboard visual assets
+│
 ├── dell-flood-backend/                     # FastAPI Backend & AI Pipeline
 │   ├── app/
 │   │   ├── aegis/                          # Core Hydrology, Routing & Detection
@@ -118,7 +153,7 @@ Aegis/
 
 ---
 
-## 🚀 Quickstart Guide
+## 🚀 Installation & Quickstart Guide
 
 ### 1. Clone the Repository
 
@@ -131,96 +166,105 @@ cd Aws_Flood
 
 ### 2. Backend Setup (`dell-flood-backend`)
 
-1. **Navigate to the backend directory:**
+1. **Navigate to backend folder:**
    ```bash
    cd dell-flood-backend
    ```
-
-2. **Create and activate a virtual environment:**
+2. **Create & activate a virtual environment:**
    ```bash
-   # Windows (PowerShell):
-   python -m venv .venv
-   .\.venv\Scripts\activate
-
-   # Linux / macOS:
-   python3 -m venv .venv
-   source .venv/bin/activate
+   python -m venv venv
+   # On Windows (PowerShell):
+   .\venv\Scripts\activate
+   # On Linux / macOS:
+   source venv/bin/activate
    ```
-
 3. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
-
-4. **Configure environment variables:**
+4. **Configure Environment Variables (`.env`):**
+   Copy `.env.example` to `.env`:
    ```bash
    cp .env.example .env
    ```
-   *Add your credentials for Google Gemini, Twilio, Sentinel Hub, and Mapbox as needed.*
+   *Fill in optional API keys (OpenAI, Gemini, Sentinel Hub, Twilio, Mapbox) as needed.*
 
-5. **Start the FastAPI backend server:**
+5. **Start the FastAPI Backend Server:**
    ```bash
    python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
    ```
-   - **Backend API:** [http://localhost:8000](http://localhost:8000)
-   - **Interactive API Docs (Swagger):** [http://localhost:8000/docs](http://localhost:8000/docs)
-   - **MCP Tool Catalog:** [http://localhost:8000/api/mcp/tools](http://localhost:8000/api/mcp/tools)
+   - **Backend API:** `http://localhost:8000` or `http://<YOUR_LOCAL_IP>:8000`
+   - **Interactive API Docs:** `http://localhost:8000/docs`
+   - **MCP Tool Catalog:** `http://localhost:8000/api/mcp/tools`
 
 ---
 
-### 3. Frontend Setup (`dell-flood-app`)
+### 3. Frontend Web Setup (`dell-flood-app`)
 
-1. **Open a new terminal and navigate to the app directory:**
+1. **Open a new terminal & navigate to app folder:**
    ```bash
    cd dell-flood-app
    ```
-
 2. **Install Node.js dependencies:**
    ```bash
    npm install
    ```
-
-3. **Launch the web application:**
+3. **Start on Website (React Native Web):**
    ```bash
    npm run web
    # Or:
    npx expo start --web
    ```
-   - Access the live app in your browser at: [http://localhost:8081](http://localhost:8081)
-
-4. **Launch on mobile (Expo Go):**
-   ```bash
-   npx expo start --lan
-   ```
-   - Scan the terminal QR code with the **Expo Go** app on Android or the default **Camera** app on iOS.
+   - Access the live web app in browser at: `http://localhost:8081`
 
 ---
 
-## 🔬 Core Components & Innovations
+### 4. Running on Mobile Phone using Expo Go 📱
 
-### 1. Dual-Encoder SegFormer SAR + Optical Fusion
-Standard optical segmentation fails during monsoon downpours and thick cloud cover. Aegis fuses:
-- **Sentinel-1 SAR C-Band VV/VH backscatter** (penetrates dense clouds and rain)
-- **Sentinel-2 Multispectral Optical bands** (NIR, Red, Green for NDWI confirmation)
-- **Elevation Normalization** via 3DEP DEM slope filtering to eliminate false water specular returns from steep radar-shadowed mountains.
+To run the mobile app on an actual Android or iOS device using **Expo Go**:
 
-### 2. 4D ConvGRU Spatiotemporal Nowcasting
-Rather than displaying a static historical footprint, Aegis propagates water volume forward through time using a 3-scale ConvGRU architecture:
-- Computes flow velocity vectors $(\mathbf{u}, \mathbf{v})$ based on local terrain slope and surface friction.
-- Forecasts flood depth $d(x, y, t)$ across $t \in [1\text{h}, 6\text{h}]$.
-- Automatically pinpoints projected peak inundation times and warning levels.
+1. **Connect to Same Wi-Fi:** Ensure your phone and development computer are connected to the **same local Wi-Fi network**.
+2. **Find Local IP Address:**
+   - **Windows:** Run `ipconfig` in CMD/PowerShell (look for IPv4 Address under Wireless LAN/Ethernet, e.g., `192.168.1.7`).
+   - **macOS / Linux:** Run `ifconfig` or `ip a`.
+3. **Configure API Endpoint:**
+   - By default, `dell-flood-app/src/services/api.ts` targets `http://192.168.1.7:8000/api`.
+   - Update `DEFAULT_API_URL` in `src/services/api.ts` or change it dynamically inside the **App Settings Panel** within the app UI.
+4. **Start Expo LAN Server:**
+   ```bash
+   npx expo start --lan
+   ```
+5. **Open in Expo Go:**
+   - **Android:** Open the **Expo Go** app, tap **Scan QR Code**, and scan the QR code printed in your terminal (or type `exp://<YOUR_LOCAL_IP>:8081`).
+   - **iOS:** Open the default **Camera App**, scan the QR code, and open in Expo Go.
 
-### 3. Autonomous 6-Agent LangGraph Pipeline
-A stateful multi-agent system executing sequentially with fallback protection:
-1. **Ingestion Agent:** Validates satellite raster availability and hydro telemetry.
-2. **Segmentation Agent:** Executes SegFormer inference to delineate active flood masks.
-3. **Hydrology Agent:** Calculates Topographic Wetness Index (TWI) pooling basins.
-4. **Cluster & Triage Agent:** Runs population density clustering to prioritize high-risk communities.
-5. **Routing Agent:** Generates elevation-weighted Dijkstra paths to the nearest certified safe shelters.
-6. **Public Advisory Agent:** Synthesizes actionable situational reports (SITREP) and dispatches localized alerts.
+---
 
-### 4. Bilingual Support (English & Hindi)
-Designed for global deployments including high-risk flood corridors in Northern and Eastern India (e.g., Patna, Bihar). The interface, audio alerts, and automated Twilio voice notifications seamlessly toggle between English and Hindi.
+### 5. Building Standalone Android APK (EAS Build)
+
+To build a standalone installable `.apk` file for Android:
+
+1. Install EAS CLI (if not installed):
+   ```bash
+   npm install -g eas-cli
+   ```
+2. Run EAS Preview Build:
+   ```bash
+   npx eas-cli build --platform android --profile preview
+   ```
+3. Once completed on Expo Cloud, download and install the resulting `.apk` file directly on any Android phone.
+
+---
+
+## 🗺️ Tactical Disaster Map Visualizations
+
+Aegis renders **100% watermark-free, high-contrast Folium HTML maps** built for emergency management operations. Every map includes an interactive Disaster HUD legend and multi-layer toggles:
+
+* **Active Inundation Footprint:** High-contrast danger polygon extracted via dual-encoder SAR/Optical satellite imagery.
+* **Critical Runoff Nodes:** Glowing magenta markers identifying concave terrain basins with high TWI scores prone to flash pooling.
+* **Affected Neighborhood Centroids:** High-contrast targets displaying population estimates and building counts from DBSCAN clustering.
+* **Safe Emergency Shelters:** Emerald pins indicating safe facilities tagged with ground DEM elevation.
+* **Elevation-Weighted Evacuation Paths:** Cyan polyline corridors steering clear of flood-prone road segments.
 
 ---
 
@@ -231,4 +275,5 @@ Designed for global deployments including high-risk flood corridors in Northern 
 ---
 
 ## 📄 License
-This project is licensed under the **MIT License**.
+
+This project is licensed under the **MIT License**. Built with physical intelligence powered by **Mireye**.
