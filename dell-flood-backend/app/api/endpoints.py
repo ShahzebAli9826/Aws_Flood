@@ -1634,7 +1634,30 @@ def report_flood(payload: CrowdReportRequest, background_tasks: BackgroundTasks 
            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
         (safe_user, payload.lat, payload.lon, safe_sev, safe_desc, model_confirmed, now_ts, safe_loc, img_b64)
     )
+    complaint_id = cursor.lastrowid
     conn.commit()
+
+    # Sync Citizen Ground Report to Amazon DynamoDB (Serverless Telemetry Store)
+    dynamo_res = {}
+    try:
+        from app.aws import dynamodb_service, cloudwatch_service
+        dynamo_res = dynamodb_service.put_citizen_report({
+            "id": complaint_id,
+            "user_id": safe_user,
+            "latitude": payload.lat,
+            "longitude": payload.lon,
+            "location_name": safe_loc or "Ground Report Zone",
+            "severity": safe_sev,
+            "description": safe_desc,
+            "status": "pending",
+        })
+        cloudwatch_service.emit_disaster_metrics(
+            location=safe_loc or "Patna, Bihar",
+            severity_index=8.5 if safe_sev in ("CRITICAL", "HIGH") else 5.5,
+            reports_ingested=1,
+        )
+    except Exception:
+        pass
 
     # Check Crowd Cluster Auto-Trigger (P28): >= 3 active complaints within 2km in last 12 hours
     cursor.execute(
@@ -1657,10 +1680,12 @@ def report_flood(payload: CrowdReportRequest, background_tasks: BackgroundTasks 
 
     return {
         "status": "SUCCESS",
+        "id": complaint_id,
         "model_confirmed": bool(model_confirmed),
         "photo_attached": has_photo,
         "nearby_cluster_count": nearby_count,
         "agent_auto_triggered": auto_triggered,
+        "aws_dynamodb": dynamo_res,
     }
 
 @router.get("/complaints/list")
@@ -2513,4 +2538,135 @@ def get_cap_alert_for_location(
         max_depth_m=max_depth_m,
         language=language,
     )
+
+
+# ===========================================================================
+# AWS FREE TIER & AWS AGENT TOOLKIT (MCP) INTEGRATION ENDPOINTS
+# ===========================================================================
+
+class SNSBroadcastRequest(BaseModel):
+    location: str = "Patna District"
+    severity_level: str = "CRITICAL"
+    water_depth_m: float = 1.4
+    shelter_name: str = "Gandhi Maidan Relief Camp"
+    custom_message: Optional[str] = None
+
+
+class PollySynthesizeRequest(BaseModel):
+    text: str = "सावधान! पटना में बाढ़ का गंभीर खतरा है। कृपया तुरंत सुरक्षित स्थान पर जाएं।"
+    language: str = "hi-IN"
+    voice_id: Optional[str] = None
+
+
+@router.get("/aws/status")
+def get_aws_integration_status():
+    """Returns real-time status of all 8 integrated AWS Free Tier services and AWS MCP Server."""
+    from app.aws import s3_service, dynamodb_service, sns_service, polly_service, cognito_service, cloudwatch_service
+    from app.mcp.aegis_mcp_server import MCP_TOOLS_REGISTRY
+
+    aws_mcp_tools = [t["name"] for t in MCP_TOOLS_REGISTRY if t["name"].startswith("aws_")]
+    return {
+        "status": "ONLINE",
+        "region": s3_service.region,
+        "aws_credentials_configured": s3_service.enabled,
+        "mode": "AWS_LIVE_CLOUD" if s3_service.enabled else "HYBRID_LOCAL_SIMULATION_READY",
+        "services": {
+            "amazon_s3": {
+                "service": "Amazon S3",
+                "tier": "5 GB Standard Storage (12-Mo Free Tier)",
+                "bucket": s3_service.bucket,
+                "live": s3_service.enabled,
+                "role": "SITREP PDF Reports, 4D Nowcast Heatmaps & Presigned URLs",
+            },
+            "amazon_dynamodb": {
+                "service": "Amazon DynamoDB",
+                "tier": "25 GB + 25 RCU/WCU (Always Free Forever)",
+                "tables": [dynamodb_service.reports_table_name, dynamodb_service.shelters_table_name],
+                "live": dynamodb_service.enabled,
+                "role": "Serverless Citizen Ground Reports & Shelter Telemetry",
+            },
+            "amazon_sns": {
+                "service": "Amazon SNS",
+                "tier": "1,000,000 Publishes/mo (Always Free Forever)",
+                "topic_arn": sns_service.topic_arn or "arn:aws:sns:ap-south-1:000000000000:Aegis-Flash-Flood-Alerts",
+                "live": sns_service.enabled,
+                "role": "Mass Emergency Evacuation SMS & Responder Broadcast",
+            },
+            "amazon_polly": {
+                "service": "Amazon Polly",
+                "tier": "5,000,000 Characters/mo (12-Mo Free Tier)",
+                "voices": ["Aditi (hi-IN)", "Raveena (en-IN)"],
+                "live": polly_service.enabled,
+                "role": "Bilingual Hindi & English Neural Emergency Voice Dispatch",
+            },
+            "amazon_cognito": {
+                "service": "Amazon Cognito",
+                "tier": "50,000 MAUs (Always Free Forever)",
+                "user_pool_id": cognito_service.user_pool_id,
+                "live": cognito_service.enabled,
+                "role": "Cryptographic OIDC/JWT Auth (IncidentCommander vs. Citizen)",
+            },
+            "amazon_cloudwatch": {
+                "service": "Amazon CloudWatch",
+                "tier": "3 Dashboards + 10 Metrics + 5 GB Logs (Always Free Forever)",
+                "namespace": cloudwatch_service.namespace,
+                "live": cloudwatch_service.enabled,
+                "role": "Live Flood Severity, Latency & Evacuation Route Telemetry",
+            },
+            "amazon_cloudfront": {
+                "service": "Amazon CloudFront + S3 Web",
+                "tier": "1 TB Data Transfer + 10M Requests (12-Mo Free Tier)",
+                "domain": s3_service.cloudfront_domain or "https://d2aegis-flood-portal.cloudfront.net",
+                "live": bool(s3_service.cloudfront_domain),
+                "role": "Global Edge CDN Delivery for Expo Web Application",
+            },
+            "aws_agent_toolkit_mcp": {
+                "service": "AWS Agent Toolkit & AWS MCP Server",
+                "tier": "Open Source / Free",
+                "endpoint": "/api/mcp/tools",
+                "aws_mcp_tools": aws_mcp_tools,
+                "role": "IAM-Guarded & CloudWatch-Audited Agent Tool Execution",
+            },
+        },
+    }
+
+
+@router.get("/aws/telemetry")
+def get_aws_cloudwatch_telemetry():
+    """Returns live Amazon CloudWatch disaster metrics and history."""
+    from app.aws import cloudwatch_service
+    return cloudwatch_service.get_dashboard_summary()
+
+
+@router.post("/alerts/broadcast-sns")
+def trigger_sns_emergency_broadcast(payload: SNSBroadcastRequest):
+    """Publishes a mass flood evacuation alert via Amazon SNS Topic."""
+    from app.aws import sns_service
+    return sns_service.broadcast_flood_warning(
+        location=payload.location,
+        severity_level=payload.severity_level,
+        water_depth_m=payload.water_depth_m,
+        shelter_name=payload.shelter_name,
+        custom_message=payload.custom_message,
+    )
+
+
+@router.post("/alerts/voice-polly")
+def trigger_polly_voice_synthesis(payload: PollySynthesizeRequest):
+    """Synthesizes Hindi or English emergency voice audio using Amazon Polly Neural TTS."""
+    from app.aws import polly_service
+    return polly_service.synthesize_emergency_alert(
+        text=payload.text,
+        language=payload.language,
+        voice_id=payload.voice_id,
+    )
+
+
+@router.get("/aws/dynamodb/reports")
+def list_dynamodb_ground_reports(limit: int = 50):
+    """Retrieves citizen flood ground reports stored in Amazon DynamoDB."""
+    from app.aws import dynamodb_service
+    items = dynamodb_service.list_citizen_reports(limit=limit)
+    return {"status": "SUCCESS", "count": len(items), "items": items}
+
 

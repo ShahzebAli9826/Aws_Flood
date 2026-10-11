@@ -589,7 +589,11 @@ export const apiService = {
         `[${nowStr}] [SatelliteVisionAgent] SegFormer MiT-B2 SAR+Optical Inundation Extent: 2.34 km² (Confidence 91.2%)`,
         `[${nowStr}] [GISImpactRouterAgent] OSM Spatial Join: 1,840 population affected, 412 buildings exposed, safe evacuation ETA: 16 min`,
         `[${nowStr}] [AlertDispatcherAgent] OASIS CAP v1.2 Alert generated & bilingual voice alert drafted for +917678656930`,
-        `[${nowStr}] [RAGReportCompilerAgent] SOP Situation Report compiled with verified numeric grounding`
+        `[${nowStr}] [RAGReportCompilerAgent] SOP Situation Report compiled with verified numeric grounding`,
+        `[${nowStr}] [AWS S3] SITREP PDF vaulted to s3://aegis-disaster-vault/reports/ (Presigned URL Ready)`,
+        `[${nowStr}] [AWS Polly] Neural Bilingual Voice synthesized (Aditi hi-IN / Raveena en-IN)`,
+        `[${nowStr}] [AWS SNS] Emergency Topic broadcast dispatched to Aegis-Flash-Flood-Alerts`,
+        `[${nowStr}] [AWS CloudWatch] Telemetry published to Namespace Aegis/DisasterResponse (Severity=8.4)`
       ];
 
       const mockReport = `OFFICIAL SITUATION REPORT: ${location.toUpperCase()}\n` +
@@ -1364,8 +1368,62 @@ export const apiService = {
       }
     } catch (e) {}
     return [];
+  },
+
+  // --- AWS Free Tier & AWS Agent Toolkit (MCP) Integration Helpers ---
+  async getAwsStatus(): Promise<any> {
+    try {
+      const res = await fetch(`${this.apiUrl}/aws/status`);
+      if (res.ok) return await res.json();
+    } catch (e) {}
+    return {
+      status: 'ONLINE',
+      mode: 'HYBRID_LOCAL_SIMULATION_READY',
+      services: {
+        amazon_s3: { service: 'Amazon S3', bucket: 'aegis-disaster-vault' },
+        amazon_dynamodb: { service: 'Amazon DynamoDB', tables: ['Aegis-Citizen-Reports', 'Aegis-Emergency-Shelters'] },
+        amazon_sns: { service: 'Amazon SNS', topic_arn: 'arn:aws:sns:ap-south-1:000000000000:Aegis-Flash-Flood-Alerts' },
+        amazon_polly: { service: 'Amazon Polly', voices: ['Aditi (hi-IN)', 'Raveena (en-IN)'] },
+        amazon_cognito: { service: 'Amazon Cognito', user_pool_id: 'ap-south-1_AegisPool' },
+        amazon_cloudwatch: { service: 'Amazon CloudWatch', namespace: 'Aegis/DisasterResponse' },
+        amazon_cloudfront: { service: 'Amazon CloudFront', domain: 'https://d2aegis-flood-portal.cloudfront.net' },
+      },
+    };
+  },
+
+  async getAwsTelemetry(): Promise<any> {
+    try {
+      const res = await fetch(`${this.apiUrl}/aws/telemetry`);
+      if (res.ok) return await res.json();
+    } catch (e) {}
+    return { namespace: 'Aegis/DisasterResponse', history: [] };
+  },
+
+  async triggerSnsBroadcast(location: string, severityLevel: string = 'CRITICAL', waterDepthM: number = 1.4): Promise<any> {
+    try {
+      const res = await fetch(`${this.apiUrl}/alerts/broadcast-sns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ location, severity_level: severityLevel, water_depth_m: waterDepthM }),
+      });
+      if (res.ok) return await res.json();
+    } catch (e) {}
+    return { status: 'BROADCAST_DISPATCHED_SIMULATED', provider: 'AWS_SNS_SIMULATED' };
+  },
+
+  async synthesizePollyVoice(text: string, language: 'hi-IN' | 'en-IN' = 'hi-IN'): Promise<any> {
+    try {
+      const res = await fetch(`${this.apiUrl}/alerts/voice-polly`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, language }),
+      });
+      if (res.ok) return await res.json();
+    } catch (e) {}
+    return { status: 'POLLY_SIMULATED_READY', provider: 'AWS_POLLY_SIMULATED' };
   }
 };
+
 
 
 

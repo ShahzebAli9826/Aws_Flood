@@ -20,6 +20,7 @@ from app.aegis.pipeline.impact_analyzer import calculate_live_impact
 from app.RAG.generator import SituationReportGenerator
 from app.agent.incident_orchestrator import get_incident_orchestrator
 from app.api.auth_deps import slugify_location
+from app.aws import s3_service, sns_service, polly_service, cloudwatch_service
 
 
 class FloodAgentState:
@@ -67,6 +68,7 @@ class FloodAgent:
         if phone_numbers is None:
             phone_numbers = ["+917678656930"]
         cycle_logs = []
+        cycle_start_t = time.time()
 
         def rlog(msg: str):
             self.state.log(msg, cycle_logs=cycle_logs)
@@ -110,17 +112,64 @@ class FloodAgent:
         peak_depth_m = float(urnn_data.get("horizon_metrics", {}).get("t_60m", {}).get("max_depth_m", 0.74))
         report_text = orch_res.get("situation_report", "")
 
-        # Export slugified PDF report
+        # Export slugified PDF report & Vault to Amazon S3
+        s3_report_info = {}
         try:
             safe_loc = slugify_location(location)
             pdf_filename = f"report_{safe_loc}_{int(time.time())}.pdf"
+            os.makedirs("./reports", exist_ok=True)
             pdf_path = f"./reports/{pdf_filename}"
             export_pdf(pdf_path, report_text or classification, location, severity)
-            rlog(f"  [OK] PDF exported: {pdf_filename}")
+            s3_report_info = s3_service.upload_pdf_report(pdf_path, pdf_filename)
+            rlog(f"  [AWS S3] SITREP PDF vaulted: {s3_report_info.get('s3_key')} ({s3_report_info.get('status')})")
         except Exception as pdf_err:
-            rlog(f"  [WARN] PDF export notice: {pdf_err}")
+            rlog(f"  [WARN] PDF/S3 export notice: {pdf_err}")
 
-        #Bounded memory update (max 100 entries — Solves P7)
+        # Synthesize Bilingual Emergency Voice Alert via Amazon Polly
+        polly_info = {}
+        try:
+            tts_lang = "hi-IN" if str(language).lower().startswith("hi") else "en-IN"
+            tts_text = (
+                f"सावधान! {location} में बाढ़ का गंभीर खतरा है। जल स्तर {peak_depth_m:.1f} मीटर तक पहुंच सकता है। कृपया सुरक्षित आश्रय स्थल की ओर प्रस्थान करें।"
+                if tts_lang == "hi-IN"
+                else f"Emergency Flood Alert for {location}. Projected water depth is {peak_depth_m:.1f} meters. Proceed to the nearest high-elevation shelter immediately."
+            )
+            polly_info = polly_service.synthesize_emergency_alert(tts_text, language=tts_lang)
+            rlog(f"  [AWS Polly] Neural Voice synthesized ({polly_info.get('voice_id')}, {tts_lang}): {polly_info.get('s3_key')}")
+        except Exception as polly_err:
+            rlog(f"  [WARN] Polly synthesis notice: {polly_err}")
+
+        # Broadcast Emergency Alert via Amazon SNS
+        sns_info = {}
+        try:
+            sns_info = sns_service.broadcast_flood_warning(
+                location=location,
+                severity_level=severity,
+                water_depth_m=peak_depth_m,
+                evacuation_url=s3_report_info.get("cloud_url_preview", "http://localhost:8081"),
+            )
+            rlog(f"  [AWS SNS] Emergency Topic broadcast dispatched: MessageID={sns_info.get('message_id')}")
+        except Exception as sns_err:
+            rlog(f"  [WARN] SNS broadcast notice: {sns_err}")
+
+        # Emit Telemetry Metrics to Amazon CloudWatch
+        cw_info = {}
+        try:
+            sev_map = {"CRITICAL": 9.2, "HIGH": 7.8, "MODERATE": 5.4, "LOW": 2.5}
+            sev_score = sev_map.get(str(severity).upper(), 7.5)
+            elapsed_ms = (time.time() - cycle_start_t) * 1000.0
+            cw_info = cloudwatch_service.emit_disaster_metrics(
+                location=location,
+                severity_index=sev_score,
+                evacuation_routes_count=max(1, facilities_at_risk),
+                nowcast_latency_ms=elapsed_ms,
+                reports_ingested=1,
+            )
+            rlog(f"  [AWS CloudWatch] Telemetry published to {cw_info.get('namespace')} (Severity={sev_score})")
+        except Exception as cw_err:
+            rlog(f"  [WARN] CloudWatch metric notice: {cw_err}")
+
+        # Bounded memory update (max 100 entries — Solves P7)
         if len(self.state.memory) >= 100:
             self.state.memory.pop(next(iter(self.state.memory)), None)
         self.state.memory[location] = {
@@ -157,5 +206,12 @@ class FloodAgent:
             "hitl_draft_id": orch_res.get("hitl_draft_id"),
             "evacuation": orch_res.get("evacuation", {}),
             "urnn": urnn_data,
+            "aws_cloud": {
+                "s3_report": s3_report_info,
+                "sns_broadcast": sns_info,
+                "polly_audio": polly_info,
+                "cloudwatch_telemetry": cw_info,
+            },
             "logs": cycle_logs,
         }
+

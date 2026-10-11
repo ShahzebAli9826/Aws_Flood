@@ -21,6 +21,7 @@ from app.ml.postprocess import PostProcessor
 from app.ml.urnn_nowcaster import get_shared_urnn
 from app.aegis.pipeline.impact_analyzer import calculate_live_impact
 from app.aegis.routing.evacuation_engine import compute_elevation_evacuation_route
+from app.aws import s3_service, dynamodb_service, sns_service, polly_service, cloudwatch_service
 
 mcp_router = APIRouter(prefix="/api/mcp", tags=["Aegis Formal MCP Server"])
 
@@ -191,6 +192,73 @@ MCP_TOOLS_REGISTRY: List[Dict[str, Any]] = [
             "required": ["location", "severity"],
         },
         "requires_official_approval": True,
+    },
+    {
+        "name": "aws_upload_report_s3",
+        "description": "AWS Agent Toolkit MCP Tool: Vaults SITREP PDF report to Amazon S3 and generates 24h pre-signed URL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "local_filepath": {"type": "string"},
+                "report_filename": {"type": "string"},
+            },
+            "required": ["local_filepath"],
+        },
+        "requires_official_approval": False,
+    },
+    {
+        "name": "aws_record_ground_report_dynamodb",
+        "description": "AWS Agent Toolkit MCP Tool: Persists citizen flood ground report to Amazon DynamoDB table.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location_name": {"type": "string"},
+                "latitude": {"type": "number"},
+                "longitude": {"type": "number"},
+                "severity": {"type": "string"},
+                "water_depth": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["location_name", "severity"],
+        },
+        "requires_official_approval": False,
+    },
+    {
+        "name": "aws_broadcast_alert_sns",
+        "description": "AWS Agent Toolkit MCP Tool: Publishes mass emergency flood broadcast via Amazon SNS Topic.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "severity_level": {"type": "string"},
+                "water_depth_m": {"type": "number"},
+                "shelter_name": {"type": "string"},
+            },
+            "required": ["location", "severity_level"],
+        },
+        "requires_official_approval": True,
+    },
+    {
+        "name": "aws_synthesize_voice_polly",
+        "description": "AWS Agent Toolkit MCP Tool: Synthesizes Hindi ('Aditi') or English ('Raveena') emergency audio via Amazon Polly.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "language": {"type": "string"},
+            },
+            "required": ["text"],
+        },
+        "requires_official_approval": False,
+    },
+    {
+        "name": "aws_get_cloudwatch_metrics",
+        "description": "AWS Agent Toolkit MCP Tool: Queries live Amazon CloudWatch disaster telemetry and severity curves.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+        "requires_official_approval": False,
     },
 ]
 
@@ -398,6 +466,30 @@ def execute_mcp_tool(tool_name: str, arguments: Dict[str, Any], idempotency_key:
             language=str(arguments.get("language", "hi")),
             max_depth_m=float(arguments.get("max_depth_m", 0.78)),
         )
+
+    elif tool_name == "aws_upload_report_s3":
+        local_fp = str(arguments.get("local_filepath", "./reports/assam_top10_brief.pdf"))
+        rep_fn = arguments.get("report_filename")
+        data = s3_service.upload_pdf_report(local_fp, rep_fn)
+
+    elif tool_name == "aws_record_ground_report_dynamodb":
+        data = dynamodb_service.put_citizen_report(arguments)
+
+    elif tool_name == "aws_broadcast_alert_sns":
+        data = sns_service.broadcast_flood_warning(
+            location=location,
+            severity_level=str(arguments.get("severity_level", "CRITICAL")),
+            water_depth_m=float(arguments.get("water_depth_m", 1.2)),
+            shelter_name=str(arguments.get("shelter_name", "Gandhi Maidan Relief Camp")),
+        )
+
+    elif tool_name == "aws_synthesize_voice_polly":
+        text_msg = str(arguments.get("text", f"Emergency flood warning for {location}. Evacuate immediately."))
+        lang_code = str(arguments.get("language", "hi-IN"))
+        data = polly_service.synthesize_emergency_alert(text_msg, language=lang_code)
+
+    elif tool_name == "aws_get_cloudwatch_metrics":
+        data = cloudwatch_service.get_dashboard_summary()
 
     else:
         raise ValueError(f"Unknown MCP tool: {tool_name}")

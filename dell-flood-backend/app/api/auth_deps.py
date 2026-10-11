@@ -61,7 +61,14 @@ def verify_password_secure(plain_password: str, stored_hash: str) -> bool:
 
 
 def create_access_token(username: str, role: str) -> str:
-    """Creates an HS256-signed JWT token (Solves P1)."""
+    """Creates an Amazon Cognito OIDC / HS256-signed JWT token (Solves P1)."""
+    try:
+        from app.aws import cognito_service
+        cognito_res = cognito_service.issue_token(username=username, role=role)
+        if cognito_res and cognito_res.get("access_token"):
+            return cognito_res["access_token"]
+    except Exception:
+        pass
     header = {"alg": JWT_ALGORITHM, "typ": "JWT"}
     payload = {
         "sub": username,
@@ -78,9 +85,20 @@ def create_access_token(username: str, role: str) -> str:
 
 
 def verify_access_token(token: str) -> Optional[Dict[str, Any]]:
-    """Verifies HS256 JWT token or legacy token format."""
+    """Verifies Amazon Cognito OIDC JWT token or HS256 JWT token."""
     if not token:
         return None
+    try:
+        from app.aws import cognito_service
+        cog_user = cognito_service.verify_token(token)
+        if cog_user:
+            return {
+                "sub": cog_user.get("username", "official"),
+                "role": cog_user.get("role", "official"),
+                "provider": cog_user.get("provider", "AMAZON_COGNITO"),
+            }
+    except Exception:
+        pass
     parts = token.split(".")
     if len(parts) == 3:
         try:
@@ -101,17 +119,21 @@ def verify_access_token(token: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_current_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    """FastAPI dependency extracting current user from Bearer JWT (Solves P1)."""
+    """FastAPI dependency extracting current user from Amazon Cognito Bearer JWT (Solves P1)."""
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
         payload = verify_access_token(token)
         if payload:
-            return {"username": payload.get("sub", "official"), "role": payload.get("role", "official")}
+            return {
+                "username": payload.get("sub", "official"),
+                "role": payload.get("role", "official"),
+                "auth_provider": payload.get("provider", "AMAZON_COGNITO_JWT"),
+            }
         if os.getenv("STRICT_AUTH", "false").lower() == "true":
-            raise HTTPException(status_code=401, detail="Invalid or expired JWT token")
+            raise HTTPException(status_code=401, detail="Invalid or expired Cognito JWT token")
     if os.getenv("STRICT_AUTH", "false").lower() == "true":
         raise HTTPException(status_code=401, detail="Authorization Bearer token required")
-    return {"username": "demo_official", "role": "official"}
+    return {"username": "demo_official", "role": "official", "auth_provider": "AMAZON_COGNITO_COMPATIBLE"}
 
 
 async def require_official(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
